@@ -1,0 +1,3294 @@
+---
+title: "S&P 500 ESG Data Pipeline and Crash-Risk Warning System"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  start_year: 2012        # First year of the panel window
+  end_year: 2023          # Last year of feature data; also serves as the external test feature year
+  run_live_edgar_fill: false  # Set to true to download missing 10-K filings from SEC EDGAR (slow)
+  fill_start_year: 2021   # Earliest year to backfill when live EDGAR is enabled
+  fill_end_year: 2023     # Latest year to backfill when live EDGAR is enabled
+  live_fill_max_companies: 10  # Cap on companies per live EDGAR run (0 = no limit)
+  sec_user_agent: "Academic ESG Project research@example.com"  # Required by SEC for rate-limiting
+---
+
+## Goal
+
+This notebook implements a complete S&P 500 ESG research pipeline with three integrated layers:
+
+1. **Data Foundation**: Build a multi-year firm-year panel by merging the current S&P 500 constituent universe, daily price history (Yahoo Finance), a cross-sectional ESG snapshot, and annual EDGAR 10-K text-based ESG signals.
+2. **Data Usability Audit**: Measure coverage, missingness, and sample usability under dual-denominator definitions (full 503-firm sample vs. effective post-index-entry sample), broken down by year and sector.
+3. **Crash-Risk Warning System**: Train and validate supervised learning models (weighted logistic regression, probability random forest) across nested feature sets to predict one-year and two-year-ahead stock price crash events, with threshold-optimized company-level warning lists.
+
+The core research question: **Can ESG signals — both snapshot ratings and text-derived keyword intensity from SEC filings — improve crash-risk prediction beyond price-based features alone?**
+
+Important caveats:
+
+- The panel is built from the **current** S&P 500 constituent set, so historical rows carry **survivorship bias**.
+- The snapshot ESG source is cross-sectional (one observation per firm), not year-specific.
+- EDGAR ESG scores are text-derived keyword intensity measures, not externally validated ratings.
+- Model outputs should be treated as **screening signals**, not investment or credit decisions.
+
+## Dependencies and Paths
+
+```{r setup}
+# ---------------------------------------------------------------------------
+# Package installation and loading
+# ---------------------------------------------------------------------------
+# All packages are declared upfront so missing ones are auto-installed.
+# This keeps the notebook self-contained on any machine with R and rmarkdown.
+required_packages <- c(
+  "dplyr",         # Data manipulation
+  "readr",         # CSV reading/writing
+  "stringr",       # String processing
+  "purrr",         # Functional programming tools
+  "tidyr",         # Data reshaping
+  "tibble",        # Modern data frames
+  "lubridate",     # Date handling
+  "jsonlite",      # JSON parsing (SEC EDGAR API)
+  "xml2",          # XML/HTML parsing
+  "rvest",         # Web scraping (Wikipedia)
+  "curl",          # HTTP requests
+  "janitor",       # Data cleaning helpers
+  "knitr",         # Notebook rendering
+  "rmarkdown",     # R Markdown engine
+  "data.table",    # Fast CSV I/O via fread/fwrite
+  "ggplot2",       # Visualization
+  "scales",        # Axis formatting
+  "ranger",        # Random forest (probability estimation)
+  "tidyquant",     # Financial data utilities
+  "quantmod",      # Quantitative finance tools
+  "zoo"            # Time series utilities
+)
+
+missing_packages <- setdiff(required_packages, rownames(installed.packages()))
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org/")
+}
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = TRUE,
+  message = TRUE
+)
+
+options(stringsAsFactors = FALSE)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(stringr)
+  library(purrr)
+  library(tidyr)
+  library(tibble)
+  library(lubridate)
+  library(jsonlite)
+  library(xml2)
+  library(rvest)
+  library(curl)
+  library(janitor)
+  library(data.table)
+  library(ggplot2)
+  library(scales)
+  library(zoo)
+})
+
+# ---------------------------------------------------------------------------
+# Project path resolution
+# ---------------------------------------------------------------------------
+# The notebook auto-detects its own directory so relative paths work
+# regardless of where knitr is invoked from.
+
+get_document_dir <- function() {
+  input_path <- tryCatch(knitr::current_input(dir = TRUE), error = function(error) "")
+
+  if (nzchar(input_path) && file.exists(input_path)) {
+    return(dirname(normalizePath(input_path, winslash = "/", mustWork = TRUE)))
+  }
+
+  normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+}
+
+PROJECT_ROOT <- get_document_dir()
+DATA_DIR <- file.path(PROJECT_ROOT, "data")
+RAW_DIR <- file.path(DATA_DIR, "raw")
+DERIVED_DIR <- file.path(DATA_DIR, "derived")
+OUTPUT_DIR <- file.path(PROJECT_ROOT, "output")
+OUTPUT_USABILITY_DIR <- file.path(OUTPUT_DIR, "01_data_usability")
+OUTPUT_ML_DIR <- file.path(OUTPUT_DIR, "02_ml_warning")
+
+# Ensure all output directories exist before any writes
+dir.create(DATA_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(RAW_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(DERIVED_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(OUTPUT_USABILITY_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(OUTPUT_ML_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ---------------------------------------------------------------------------
+# Global parameters — derived from YAML header or environment variables
+# ---------------------------------------------------------------------------
+START_YEAR <- as.integer(params$start_year)                   # 2012
+END_YEAR <- as.integer(params$end_year)                       # 2023 — last feature year
+WARNING_EXTERNAL_START_YEAR <- 2024L                          # First year of external test window
+WARNING_EXTERNAL_END_YEAR <- 2025L                            # Last year of external test window
+WARNING_LOOKAHEAD_YEARS <- 2L                                 # Number of forward years for 2Y labels
+# Environment flags allow forced recomputation of cached price/label files
+FORCE_REFRESH_WARNING_PRICES <- identical(Sys.getenv("FORCE_REFRESH_WARNING_PRICES"), "1") ||
+  identical(Sys.getenv("FORCE_REFRESH_2024_PRICES"), "1") ||
+  identical(Sys.getenv("FORCE_REFRESH_2025_PRICES"), "1")
+FORCE_REBUILD_WARNING_LABELS <- identical(Sys.getenv("FORCE_REBUILD_WARNING_LABELS"), "1")
+
+# ---------------------------------------------------------------------------
+# External data source URLs and headers
+# ---------------------------------------------------------------------------
+WIKI_URL <- "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+# SEC requires a User-Agent header identifying the requester
+SEC_HEADERS <- c(
+  "User-Agent" = params$sec_user_agent,
+  "Accept" = "application/json, text/html;q=0.9"
+)
+
+# All required source files live under data/raw so the project is portable.
+# If any are missing, the notebook halts immediately with a clear error.
+EXTERNAL_SOURCES <- list(
+  snapshot_esg = file.path(RAW_DIR, "SP 500 ESG Risk Ratings.csv"),
+  universe_cache = file.path(RAW_DIR, "company_universe.csv"),
+  price_cache = file.path(RAW_DIR, "prices_daily.csv"),
+  edgar_cache = file.path(RAW_DIR, "esg_signals_panel.csv")
+)
+
+missing_source_files <- unname(EXTERNAL_SOURCES[!vapply(EXTERNAL_SOURCES, file.exists, logical(1))])
+
+if (length(missing_source_files) > 0) {
+  stop(sprintf(
+    "Missing required local source file(s) under data/raw: %s",
+    paste(basename(missing_source_files), collapse = ", ")
+  ))
+}
+
+# ---------------------------------------------------------------------------
+# Output file path definitions — all derived and output files are named here
+# so the notebook has a single source of truth for every write/read path.
+# ---------------------------------------------------------------------------
+
+# Stage 1: Data foundation outputs
+OUTPUT_FILES <- list(
+  constituents = file.path(DERIVED_DIR, "sp500_constituents_current.csv"),
+  constituents_cache = file.path(DERIVED_DIR, "sp500_wiki_current.csv"),
+  price_daily = file.path(DERIVED_DIR, "sp500_price_daily_2011_2023.csv"),
+  price_annual = file.path(DERIVED_DIR, "sp500_price_annual_features_2012_2023.csv"),
+  edgar_yearly = file.path(DERIVED_DIR, "sp500_edgar_esg_annual_2012_2023.csv"),
+  panel = file.path(DERIVED_DIR, "sp500_price_esg_panel_2012_2023.csv"),
+  coverage_year = file.path(OUTPUT_DIR, "sp500_coverage_by_year.csv"),
+  coverage_overview = file.path(OUTPUT_DIR, "sp500_coverage_overview.csv"),
+  coverage_company = file.path(OUTPUT_DIR, "sp500_company_coverage_flags.csv")
+)
+
+# Stage 2: Usability audit outputs (tables + charts)
+OUTPUT_USABILITY_FILES <- list(
+  overview = file.path(OUTPUT_USABILITY_DIR, "01_overview_dual_denominator.csv"),
+  coverage_year = file.path(OUTPUT_USABILITY_DIR, "02_coverage_by_year_dual_denominator.csv"),
+  coverage_sector = file.path(OUTPUT_USABILITY_DIR, "03_coverage_by_sector_dual_denominator.csv"),
+  field_missingness = file.path(OUTPUT_USABILITY_DIR, "04_field_missingness.csv"),
+  company_buckets = file.path(OUTPUT_USABILITY_DIR, "05_company_coverage_buckets.csv"),
+  special_cases = file.path(OUTPUT_USABILITY_DIR, "06_special_cases_summary.csv"),
+  yearly_lines = file.path(OUTPUT_USABILITY_DIR, "11_yearly_coverage_lines.png"),
+  joint_bars = file.path(OUTPUT_USABILITY_DIR, "12_yearly_joint_coverage_bars.png"),
+  sector_heatmap = file.path(OUTPUT_USABILITY_DIR, "13_sector_coverage_heatmap.png"),
+  missingness_bar = file.path(OUTPUT_USABILITY_DIR, "14_field_missingness_bar.png"),
+  bucket_bar = file.path(OUTPUT_USABILITY_DIR, "15_company_bucket_bar.png")
+)
+
+# Stage 3A: Derived ML files (price extensions, crash labels, modeling panels)
+DERIVED_ML_FILES <- list(
+  price_2024 = file.path(DERIVED_DIR, "sp500_price_daily_2024.csv"),
+  price_2025 = file.path(DERIVED_DIR, "sp500_price_daily_2025.csv"),
+  price_daily_extended = file.path(DERIVED_DIR, "sp500_price_daily_2011_2025.csv"),
+  crash_metrics_extended = file.path(DERIVED_DIR, "sp500_crash_metrics_2012_2025.csv"),
+  ml_panel = file.path(DERIVED_DIR, "sp500_ml_panel_2y_2012_2023_features_to_2024_2025_labels.csv")
+)
+
+# Stage 3B: ML output files (metrics, predictions, charts)
+OUTPUT_ML_FILES <- list(
+  training_panel = file.path(OUTPUT_ML_DIR, "01_training_panel_2y.csv"),
+  validation_fold_metrics = file.path(OUTPUT_ML_DIR, "02_validation_fold_metrics_2y.csv"),
+  threshold_tuning = file.path(OUTPUT_ML_DIR, "03_threshold_tuning_2y.csv"),
+  cv_model_comparison = file.path(OUTPUT_ML_DIR, "04_model_comparison_cv_2y.csv"),
+  test_metrics = file.path(OUTPUT_ML_DIR, "05_external_test_metrics_2024_2025_2y.csv"),
+  confusion_matrix = file.path(OUTPUT_ML_DIR, "06_confusion_matrix_by_model_2y.csv"),
+  company_predictions = file.path(OUTPUT_ML_DIR, "07_company_predictions_2024_2025_2y.csv"),
+  top_risk_companies = file.path(OUTPUT_ML_DIR, "08_high_risk_companies_2024_2025_2y.csv"),
+  pr_curve = file.path(OUTPUT_ML_DIR, "11_pr_curve_2y.png"),
+  accuracy_precision_plot = file.path(OUTPUT_ML_DIR, "12_accuracy_precision_comparison_2y.png"),
+  confusion_all_plot = file.path(OUTPUT_ML_DIR, "13_confusion_matrix_all_models_2y.png"),
+  confusion_champion_plot = file.path(OUTPUT_ML_DIR, "14_confusion_matrix_champion_2y.png"),
+  top_risk_plot = file.path(OUTPUT_ML_DIR, "15_top_risk_companies_2y.png"),
+  logistic_coef_plot = file.path(OUTPUT_ML_DIR, "16_logistic_coefficients_2y.png"),
+  forest_importance_plot = file.path(OUTPUT_ML_DIR, "17_forest_importance_2y.png")
+)
+
+message("Project root detected.")
+message(sprintf("Snapshot ESG source file: %s", basename(EXTERNAL_SOURCES$snapshot_esg)))
+message(sprintf("Universe cache source file: %s", basename(EXTERNAL_SOURCES$universe_cache)))
+message(sprintf("Price cache source file: %s", basename(EXTERNAL_SOURCES$price_cache)))
+message(sprintf("EDGAR cache source file: %s", basename(EXTERNAL_SOURCES$edgar_cache)))
+```
+## Helper Functions
+
+```{r helpers}
+# ---------------------------------------------------------------------------
+# Path and identifier utilities
+# ---------------------------------------------------------------------------
+
+# Strip the project root prefix from absolute paths for display purposes
+to_project_relative <- function(paths) {
+  normalized_paths <- normalizePath(paths, winslash = "/", mustWork = FALSE)
+  project_prefix <- paste0(normalizePath(PROJECT_ROOT, winslash = "/", mustWork = TRUE), "/")
+  stringr::str_replace(normalized_paths, stringr::fixed(project_prefix), "")
+}
+
+# Standardize ticker symbols: trim whitespace and replace dots with dashes.
+# Yahoo Finance and Wikipedia sometimes differ on BRK.B vs BRK-B, etc.
+normalize_symbol <- function(x) {
+  x %>%
+    stringr::str_trim() %>%
+    stringr::str_replace_all("\\.", "-")
+}
+
+# Pad CIK (Central Index Key) to SEC's canonical 10-digit zero-padded format.
+# CIK values appear with or without leading zeros across different sources.
+format_cik <- function(x) {
+  raw_cik <- stringr::str_extract(as.character(x), "\\d+")
+  stringr::str_pad(raw_cik, width = 10, side = "left", pad = "0")
+}
+
+# ---------------------------------------------------------------------------
+# HTTP/SEC EDGAR helpers
+# ---------------------------------------------------------------------------
+
+# Fetch raw binary content from a URL, optionally limiting the download size.
+# Used for SEC filings where document bodies can be very large.
+fetch_binary <- function(url, headers = NULL, max_bytes = NULL) {
+  handle <- if (is.null(headers) || length(headers) == 0) {
+    curl::new_handle()
+  } else {
+    curl::new_handle(httpheader = headers)
+  }
+
+  if (is.null(max_bytes)) {
+    response <- curl::curl_fetch_memory(url, handle = handle)
+    return(response$content)
+  }
+
+  connection <- curl::curl(url, handle = handle)
+  on.exit(close(connection), add = TRUE)
+  readBin(connection, what = "raw", n = max_bytes)
+}
+
+fetch_html <- function(url, headers = NULL) {
+  xml2::read_html(rawToChar(fetch_binary(url, headers = headers)))
+}
+
+fetch_json <- function(url, headers = NULL) {
+  jsonlite::fromJSON(rawToChar(fetch_binary(url, headers = headers)), simplifyVector = FALSE)
+}
+
+# ---------------------------------------------------------------------------
+# Financial computation helpers
+# ---------------------------------------------------------------------------
+
+# Maximum drawdown: largest peak-to-trough decline in a price series.
+# Returns a negative number (e.g., -0.35 means a 35% drawdown).
+calc_max_drawdown <- function(prices) {
+  prices <- as.numeric(prices)
+  prices <- prices[is.finite(prices)]
+
+  if (length(prices) < 2) {
+    return(NA_real_)
+  }
+
+  drawdowns <- prices / cummax(prices) - 1
+  min(drawdowns, na.rm = TRUE)
+}
+
+# ---------------------------------------------------------------------------
+# EDGAR 10-K text processing and ESG keyword extraction
+# ---------------------------------------------------------------------------
+
+# Convert raw SEC filing HTML to clean, lowercased plain text.
+# Strips scripts, styles, inline XBRL tags, and non-alphanumeric characters.
+strip_html_text <- function(html_text) {
+  clean_html <- html_text %>%
+    stringr::str_replace_all("(?is)<script.*?</script>", " ") %>%
+    stringr::str_replace_all("(?is)<style.*?</style>", " ") %>%
+    stringr::str_replace_all("(?is)</?ix:[^>]+>", " ")
+
+  plain_text <- tryCatch(
+    xml2::xml_text(xml2::read_html(clean_html)),
+    error = function(error) stringr::str_replace_all(clean_html, "<[^>]+>", " ")
+  )
+
+  plain_text %>%
+    stringr::str_to_lower() %>%
+    stringr::str_replace_all("[^a-z0-9\\s]", " ") %>%
+    stringr::str_squish()
+}
+
+# Count total keyword occurrences in text (exact substring matching, case-insensitive).
+# Each keyword is counted independently; overlapping hits are not double-counted
+# since stringr::str_count with fixed() is non-overlapping by default.
+count_keyword_hits <- function(text, keywords) {
+  sum(purrr::map_int(
+    keywords,
+    ~ stringr::str_count(text, stringr::fixed(stringr::str_to_lower(.x)))
+  ))
+}
+
+# ESG keyword dictionaries used for text-based signal extraction from 10-K filings.
+# Keywords are domain-specific terms drawn from academic ESG disclosure research.
+# The three dimensions follow standard ESG pillar definitions.
+edgar_keywords <- list(
+  e_keywords = c(
+    "climate change",
+    "greenhouse gas",
+    "carbon emission",
+    "carbon footprint",
+    "renewable energy",
+    "environmental sustainability",
+    "pollution control",
+    "net zero",
+    "clean energy",
+    "energy efficiency",
+    "biodiversity",
+    "water conservation",
+    "waste reduction",
+    "environmental impact",
+    "climate risk",
+    "carbon neutral",
+    "scope 1",
+    "scope 2",
+    "scope 3"
+  ),
+  s_keywords = c(
+    "employee wellbeing",
+    "workplace safety",
+    "diversity and inclusion",
+    "human rights",
+    "community investment",
+    "labor practices",
+    "gender diversity",
+    "health and safety",
+    "supply chain responsibility",
+    "workforce development",
+    "equal opportunity",
+    "social responsibility",
+    "pay equity",
+    "employee benefits"
+  ),
+  g_keywords = c(
+    "corporate governance",
+    "board independence",
+    "audit committee",
+    "executive compensation",
+    "whistleblower",
+    "anti-corruption",
+    "regulatory compliance",
+    "shareholder rights",
+    "board diversity",
+    "risk oversight",
+    "code of ethics",
+    "independent director"
+  )
+)
+
+# Get the SEC EDGAR submission index for a given CIK.
+# Returns a table of 10-K and 10-K/A filings with accession numbers and dates.
+# For firms with multiple filings in the same fiscal year, prefers 10-K over 10-K/A.
+get_sec_submission_map <- function(cik, start_year, end_year, headers) {
+  url <- sprintf("https://data.sec.gov/submissions/CIK%s.json", cik)
+  payload <- tryCatch(fetch_json(url, headers = headers), error = function(error) NULL)
+
+  if (is.null(payload)) {
+    return(tibble())
+  }
+
+  recent <- payload$filings$recent
+  if (is.null(recent$form)) {
+    return(tibble())
+  }
+
+  recent_table <- tibble(
+    form = unlist(recent$form),
+    accession_number = unlist(recent$accessionNumber),
+    filing_date = unlist(recent$filingDate),
+    primary_document = unlist(recent$primaryDocument)
+  ) %>%
+    filter(form %in% c("10-K", "10-K/A")) %>%
+    mutate(
+      filing_date = as.Date(filing_date),
+      filing_year = lubridate::year(filing_date),
+      # Map filing date to the fiscal year it covers: filings Jan-Mar typically
+      # cover the previous fiscal year (fiscal_year = filing_year - 1).
+      fiscal_year = if_else(lubridate::month(filing_date) >= 4L, filing_year, filing_year - 1L),
+      accession_nodash = stringr::str_replace_all(accession_number, "-", "")
+    ) %>%
+    filter(dplyr::between(fiscal_year, start_year, end_year)) %>%
+    group_by(fiscal_year) %>%
+    arrange(desc(form == "10-K/A"), .by_group = TRUE) %>%
+    slice(1) %>%
+    ungroup()
+
+  recent_table
+}
+
+# Construct the direct URL to a specific SEC filing document.
+# Format: https://www.sec.gov/Archives/edgar/data/{CIK-as-int}/{accession-nodash}/{primary-doc}
+build_sec_filing_url <- function(cik, accession_nodash, primary_document) {
+  sprintf(
+    "https://www.sec.gov/Archives/edgar/data/%s/%s/%s",
+    as.integer(cik),
+    accession_nodash,
+    primary_document
+  )
+}
+
+# Download and parse one SEC 10-K filing to extract ESG keyword intensity scores.
+# Scores are expressed as keyword hits per 1,000 filing words to normalize for
+# document length. Returns NULL if the filing is too short (< 500 words) or
+# unreachable, so the panel records these as missing EDGAR observations.
+extract_one_edgar_row <- function(cik, symbol, fiscal_year, filing_info, headers) {
+  filing_url <- build_sec_filing_url(
+    cik = cik,
+    accession_nodash = filing_info$accession_nodash,
+    primary_document = filing_info$primary_document
+  )
+
+  # Cap download at ~800KB to avoid pulling massive exhibits
+  filing_raw <- tryCatch(
+    fetch_binary(filing_url, headers = headers, max_bytes = 800000L),
+    error = function(error) NULL
+  )
+
+  if (is.null(filing_raw) || length(filing_raw) == 0) {
+    return(NULL)
+  }
+
+  filing_text <- strip_html_text(rawToChar(filing_raw))
+  word_count <- length(strsplit(filing_text, "\\s+")[[1]])
+
+  if (!is.finite(word_count) || word_count < 500) {
+    return(NULL)
+  }
+
+  # Count raw keyword hits for each ESG pillar, then scale per 1,000 words
+  e_count <- count_keyword_hits(filing_text, edgar_keywords$e_keywords)
+  s_count <- count_keyword_hits(filing_text, edgar_keywords$s_keywords)
+  g_count <- count_keyword_hits(filing_text, edgar_keywords$g_keywords)
+  scale <- max(word_count, 1) / 1000
+
+  tibble(
+    cik = cik,
+    symbol = symbol,
+    year = fiscal_year,
+    e_score = round(e_count / scale, 4),
+    s_score = round(s_count / scale, 4),
+    g_score = round(g_count / scale, 4),
+    esg_total = round((e_count + s_count + g_count) / scale, 4),
+    e_count = e_count,
+    s_count = s_count,
+    g_count = g_count,
+    word_count = word_count,
+    filing_date = as.Date(filing_info$filing_date)
+  )
+}
+```
+
+## Load the Current S&P 500 Universe
+
+This section builds the company master table by merging three sources:
+1. A cross-sectional ESG snapshot (Risk Ratings CSV)
+2. The current S&P 500 constituent list from Wikipedia
+3. A local company universe cache for ticker-to-CIK mapping
+
+All three are joined on normalized ticker symbols. When a field exists in multiple
+sources, `coalesce` picks the first non-missing value, with Wikipedia preferred
+for identifiers and the snapshot preferred for ESG metrics.
+
+```{r sp500-universe}
+# ---- Load and standardize the snapshot ESG ratings file ----
+snapshot_source_full <- readr::read_csv(
+  EXTERNAL_SOURCES$snapshot_esg,
+  show_col_types = FALSE
+)
+
+# ---- Load the local company universe cache for ticker-to-CIK mapping ----
+universe_map <- data.table::fread(
+  EXTERNAL_SOURCES$universe_cache,
+  showProgress = FALSE
+) %>%
+  as_tibble() %>%
+  transmute(
+    symbol = normalize_symbol(ticker),
+    cik_universe = format_cik(cik),
+    universe_company_name = company_name
+  )
+
+# ---- Load S&P 500 constituents: prefer cached Wikipedia scrape, re-fetch if missing ----
+sp500_table <- if (file.exists(OUTPUT_FILES$constituents_cache)) {
+  readr::read_csv(OUTPUT_FILES$constituents_cache, show_col_types = FALSE)
+} else {
+  tryCatch(
+    fetch_html(WIKI_URL, headers = SEC_HEADERS) %>%
+      rvest::html_element("table") %>%
+      rvest::html_table(),
+    error = function(error) NULL
+  )
+}
+
+# ---- Standardize Wikipedia constituent fields ----
+wiki_constituents <- if (!is.null(sp500_table)) {
+  sp500_table %>%
+    janitor::clean_names() %>%
+    transmute(
+      symbol_raw_wiki = symbol,
+      symbol = normalize_symbol(symbol_raw_wiki),
+      company_name_wiki = security,
+      gics_sector_wiki = gics_sector,
+      gics_sub_industry_wiki = gics_sub_industry,
+      headquarters_location_wiki = headquarters_location,
+      date_added = suppressWarnings(as.Date(date_added)),
+      cik_wiki = format_cik(cik),
+      founded = founded
+    )
+} else {
+  tibble(
+    symbol_raw_wiki = character(),
+    symbol = character(),
+    company_name_wiki = character(),
+    gics_sector_wiki = character(),
+    gics_sub_industry_wiki = character(),
+    headquarters_location_wiki = character(),
+    date_added = as.Date(character()),
+    cik_wiki = character(),
+    founded = character()
+  )
+}
+
+# ---- Standardize snapshot ESG fields ----
+snapshot_esg <- snapshot_source_full %>%
+  janitor::clean_names() %>%
+  transmute(
+    symbol_raw_snapshot = symbol,
+    symbol = normalize_symbol(symbol),
+    snapshot_name = name,
+    snapshot_sector = sector,
+    snapshot_industry = industry,
+    snapshot_headquarters = address,
+    snapshot_total_esg_risk = total_esg_risk_score,
+    snapshot_environment_risk = environment_risk_score,
+    snapshot_governance_risk = governance_risk_score,
+    snapshot_social_risk = social_risk_score,
+    snapshot_controversy_level = controversy_level,
+    snapshot_controversy_score = controversy_score,
+    snapshot_esg_percentile = esg_risk_percentile,
+    snapshot_esg_level = esg_risk_level
+  )
+
+# ---- Merge three sources on normalized symbol to build the company master table ----
+# Priority order (via coalesce): Wikipedia > Snapshot > Universe cache
+company_master <- snapshot_esg %>%
+  left_join(wiki_constituents, by = "symbol") %>%
+  left_join(universe_map, by = "symbol") %>%
+  mutate(
+    symbol_raw = coalesce(symbol_raw_wiki, symbol_raw_snapshot),
+    company_name = coalesce(snapshot_name, company_name_wiki, universe_company_name),
+    cik = coalesce(cik_wiki, cik_universe),
+    gics_sector = coalesce(gics_sector_wiki, snapshot_sector),
+    gics_sub_industry = coalesce(gics_sub_industry_wiki, snapshot_industry),
+    headquarters_location = coalesce(headquarters_location_wiki, snapshot_headquarters),
+    price_symbol = symbol,
+    snapshot_available = !is.na(snapshot_total_esg_risk)
+  ) %>%
+  select(
+    symbol,
+    symbol_raw,
+    company_name,
+    cik,
+    gics_sector,
+    gics_sub_industry,
+    headquarters_location,
+    date_added,
+    founded,
+    snapshot_name,
+    snapshot_sector,
+    snapshot_industry,
+    snapshot_total_esg_risk,
+    snapshot_environment_risk,
+    snapshot_governance_risk,
+    snapshot_social_risk,
+    snapshot_controversy_level,
+    snapshot_controversy_score,
+    snapshot_esg_percentile,
+    snapshot_esg_level,
+    price_symbol,
+    snapshot_available
+  )
+
+data.table::fwrite(company_master, OUTPUT_FILES$constituents)
+
+company_master %>%
+  summarise(
+    constituent_rows = n(),
+    unique_cik = n_distinct(cik),
+    snapshot_esg_available = sum(snapshot_available, na.rm = TRUE)
+  ) %>%
+  knitr::kable()
+```
+
+## Load the Multi-Year Price Cache and Build Annual Features
+
+This section reads the cached daily price history (Yahoo Finance), filters to
+the current S&P 500 universe, and aggregates into annual features:
+- **Return**: simple annual return (end_price / start_price - 1) and log return
+- **Risk**: annualized volatility (daily log return SD * sqrt(252)) and max drawdown
+- **Liquidity**: average and median daily volume
+- **Trading intensity**: number of trading days observed
+
+```{r prices}
+# ---- Build a price-symbol lookup keyed to normalized ticker ----
+price_map <- company_master %>%
+  distinct(symbol, price_symbol, company_name, cik, gics_sector, gics_sub_industry)
+
+# ---- Load the full price cache and filter to S&P 500 symbols ----
+price_daily <- data.table::fread(
+  EXTERNAL_SOURCES$price_cache,
+  select = c("ticker", "date", "adj_close", "volume"),
+  showProgress = FALSE
+) %>%
+  as_tibble() %>%
+  transmute(
+    price_symbol = normalize_symbol(ticker),
+    date = as.Date(date),
+    adj_close = as.numeric(adj_close),
+    volume = as.numeric(volume)
+  ) %>%
+  filter(price_symbol %in% price_map$price_symbol) %>%
+  inner_join(price_map, by = "price_symbol") %>%
+  arrange(symbol, date)
+
+price_daily %>%
+  summarise(
+    firms_with_prices = n_distinct(symbol),
+    daily_rows = n(),
+    first_date = min(date, na.rm = TRUE),
+    last_date = max(date, na.rm = TRUE)
+  ) %>%
+  knitr::kable()
+
+data.table::fwrite(price_daily, OUTPUT_FILES$price_daily)
+
+# ---- Aggregate daily prices into annual features per company-year ----
+annual_price_features <- price_daily %>%
+  group_by(symbol) %>%
+  arrange(date, .by_group = TRUE) %>%
+  mutate(
+    daily_return = adj_close / lag(adj_close) - 1,
+    daily_log_return = log(adj_close / lag(adj_close)),
+    year = lubridate::year(date)
+  ) %>%
+  ungroup() %>%
+  filter(dplyr::between(year, START_YEAR, END_YEAR)) %>%
+  group_by(symbol, company_name, cik, gics_sector, gics_sub_industry, year) %>%
+  summarise(
+    n_trading_days = n(),
+    first_trade = min(date),
+    last_trade = max(date),
+    start_price = first(adj_close),
+    end_price = last(adj_close),
+    annual_return = end_price / start_price - 1,
+    annual_log_return = sum(daily_log_return, na.rm = TRUE),
+    annual_volatility = sd(daily_log_return, na.rm = TRUE) * sqrt(252),
+    avg_volume = mean(volume, na.rm = TRUE),
+    median_volume = median(volume, na.rm = TRUE),
+    max_drawdown = calc_max_drawdown(adj_close),
+    .groups = "drop"
+  )
+
+data.table::fwrite(annual_price_features, OUTPUT_FILES$price_annual)
+
+annual_price_features %>%
+  summarise(
+    annual_rows = n(),
+    firms_covered = n_distinct(symbol),
+    years_covered = n_distinct(year)
+  ) %>%
+  knitr::kable()
+```
+
+## Load the Annual EDGAR ESG Cache
+
+The EDGAR ESG panel provides annual keyword-intensity scores from 10-K filings.
+Each row is one company-year with scores measured as keyword hits per 1,000 words.
+The cache is pre-built; live SEC backfill is disabled by default (see next section).
+
+```{r edgar-cache}
+# ---- Load cached EDGAR ESG signals, filter to panel years ----
+edgar_cached <- data.table::fread(
+  EXTERNAL_SOURCES$edgar_cache,
+  showProgress = FALSE
+) %>%
+  as_tibble() %>%
+  transmute(
+    cik = format_cik(cik),
+    cached_symbol = normalize_symbol(ticker),
+    year = as.integer(year),
+    e_score = as.numeric(e_score),
+    s_score = as.numeric(s_score),
+    g_score = as.numeric(g_score),
+    esg_total = as.numeric(esg_total),
+    e_count = as.numeric(e_count),
+    s_count = as.numeric(s_count),
+    g_count = as.numeric(g_count),
+    word_count = as.numeric(word_count),
+    filing_date = as.Date(filing_date)
+  ) %>%
+  filter(dplyr::between(year, START_YEAR, END_YEAR)) %>%
+  semi_join(company_master %>% distinct(cik), by = "cik") %>%
+  arrange(cik, year) %>%
+  distinct(cik, year, .keep_all = TRUE)
+
+edgar_cached %>%
+  summarise(
+    edgar_rows = n(),
+    firms_with_edgar = n_distinct(cik),
+    first_year = min(year, na.rm = TRUE),
+    last_year = max(year, na.rm = TRUE)
+  ) %>%
+  knitr::kable()
+```
+
+## Optional: Live Backfill of Missing EDGAR Records
+
+This step is disabled by default because pulling 10-K text in bulk for roughly 500 firms is slow.
+
+If you want to continue filling missing observations later, set `run_live_edgar_fill` to `true` in the YAML parameters and replace `sec_user_agent` with your own contact email.
+
+```{r edgar-live-fill, eval = params$run_live_edgar_fill}
+fill_years <- seq.int(as.integer(params$fill_start_year), as.integer(params$fill_end_year))
+
+missing_company_years <- company_master %>%
+  distinct(symbol, cik) %>%
+  tidyr::crossing(year = fill_years) %>%
+  anti_join(edgar_cached %>% distinct(cik, year), by = c("cik", "year")) %>%
+  filter(!is.na(cik))
+
+candidate_companies <- missing_company_years %>%
+  distinct(symbol, cik) %>%
+  {
+    if (isTRUE(params$live_fill_max_companies > 0)) slice_head(., n = params$live_fill_max_companies) else .
+  }
+
+message(sprintf("Live EDGAR fill candidate companies: %d", nrow(candidate_companies)))
+
+live_rows <- purrr::map_dfr(seq_len(nrow(candidate_companies)), function(index) {
+  one_company <- candidate_companies[index, ]
+  message(sprintf("[%d/%d] Pulling SEC submissions for %s (%s)", index, nrow(candidate_companies), one_company$symbol, one_company$cik))
+
+  submission_map <- get_sec_submission_map(
+    cik = one_company$cik,
+    start_year = min(fill_years),
+    end_year = max(fill_years),
+    headers = SEC_HEADERS
+  )
+
+  if (nrow(submission_map) == 0) {
+    return(tibble())
+  }
+
+  target_rows <- submission_map %>%
+    filter(fiscal_year %in% fill_years)
+
+  purrr::map_dfr(seq_len(nrow(target_rows)), function(row_index) {
+    Sys.sleep(0.25)
+    extract_one_edgar_row(
+      cik = one_company$cik,
+      symbol = one_company$symbol,
+      fiscal_year = target_rows$fiscal_year[row_index],
+      filing_info = target_rows[row_index, ],
+      headers = SEC_HEADERS
+    )
+  })
+})
+
+if (nrow(live_rows) > 0) {
+  edgar_cached <- bind_rows(
+    edgar_cached %>%
+      transmute(
+        cik,
+        cached_symbol = symbol,
+        year,
+        e_score,
+        s_score,
+        g_score,
+        esg_total,
+        e_count,
+        s_count,
+        g_count,
+        word_count,
+        filing_date
+      ),
+    live_rows %>%
+      transmute(
+        cik,
+        cached_symbol = symbol,
+        year,
+        e_score,
+        s_score,
+        g_score,
+        esg_total,
+        e_count,
+        s_count,
+        g_count,
+        word_count,
+        filing_date
+      )
+  ) %>%
+    arrange(cik, year) %>%
+    distinct(cik, year, .keep_all = TRUE)
+```
+
+## Assemble the Final Price + ESG Panel
+
+Construct the firm-year panel by crossing each company with every year in the
+study window, then left-joining annual price features and EDGAR ESG signals.
+Row status flags (`panel_row_status`) track which data sources are available
+for each firm-year, making coverage measurement straightforward.
+
+```{r final-panel}
+# ---- Start with company × year Cartesian product as the panel base ----
+panel_base <- company_master %>%
+  select(
+    symbol,
+    symbol_raw,
+    company_name,
+    cik,
+    gics_sector,
+    gics_sub_industry,
+    headquarters_location,
+    date_added,
+    founded,
+    snapshot_name,
+    snapshot_sector,
+    snapshot_industry,
+    snapshot_total_esg_risk,
+    snapshot_environment_risk,
+    snapshot_governance_risk,
+    snapshot_social_risk,
+    snapshot_controversy_level,
+    snapshot_controversy_score,
+    snapshot_esg_percentile,
+    snapshot_esg_level,
+    snapshot_available
+  ) %>%
+  tidyr::crossing(year = seq.int(START_YEAR, END_YEAR))
+
+# ---- Align cached EDGAR data to the panel base via CIK + year ----
+edgar_yearly <- panel_base %>%
+  distinct(symbol, cik, year) %>%
+  left_join(edgar_cached, by = c("cik", "year")) %>%
+  mutate(
+    edgar_symbol = coalesce(cached_symbol, symbol),
+    edgar_available = !is.na(esg_total)
+  ) %>%
+  select(
+    symbol,
+    cik,
+    year,
+    edgar_symbol,
+    edgar_available,
+    edgar_e_score = e_score,
+    edgar_s_score = s_score,
+    edgar_g_score = g_score,
+    edgar_esg_total = esg_total,
+    edgar_e_count = e_count,
+    edgar_s_count = s_count,
+    edgar_g_count = g_count,
+    edgar_word_count = word_count,
+    edgar_filing_date = filing_date
+  )
+
+data.table::fwrite(edgar_yearly, OUTPUT_FILES$edgar_yearly)
+
+# ---- Left-join price features and EDGAR signals to complete the panel ----
+final_panel <- panel_base %>%
+  left_join(
+    annual_price_features,
+    by = c("symbol", "company_name", "cik", "gics_sector", "gics_sub_industry", "year")
+  ) %>%
+  left_join(edgar_yearly, by = c("symbol", "cik", "year")) %>%
+  mutate(
+    price_available = !is.na(end_price),
+    edgar_available = coalesce(edgar_available, FALSE),
+    # Firms are "post index addition" from the year they joined the S&P 500 onward.
+    # Firms missing date_added are treated as always in the index (conservative).
+    is_post_index_addition = if_else(!is.na(date_added), year >= lubridate::year(date_added), TRUE),
+    panel_row_status = case_when(
+      price_available & edgar_available ~ "price_and_edgar",
+      price_available & !edgar_available ~ "price_only",
+      !price_available & edgar_available ~ "edgar_only",
+      TRUE ~ "missing_both"
+    )
+  ) %>%
+  arrange(symbol, year)
+
+data.table::fwrite(final_panel, OUTPUT_FILES$panel)
+```
+
+## Coverage Checks
+
+Basic coverage diagnostics: how many firms have price, EDGAR ESG, or snapshot ESG
+data in each year? These summaries feed the downstream usability audit and help
+spot data gaps before modeling.
+
+```{r coverage}
+# ---- Yearly coverage: fraction of firms with each data type ----
+coverage_by_year <- final_panel %>%
+  group_by(year) %>%
+  summarise(
+    firms_total = n(),
+    firms_with_price = sum(price_available, na.rm = TRUE),
+    firms_with_edgar = sum(edgar_available, na.rm = TRUE),
+    firms_with_snapshot = sum(snapshot_available, na.rm = TRUE),
+    firms_with_price_and_edgar = sum(price_available & edgar_available, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    price_coverage = round(firms_with_price / firms_total, 4),
+    edgar_coverage = round(firms_with_edgar / firms_total, 4),
+    snapshot_coverage = round(firms_with_snapshot / firms_total, 4)
+  )
+
+coverage_overview <- tibble(
+  metric = c(
+    "constituent_rows",
+    "unique_cik",
+    "years_in_panel",
+    "panel_rows",
+    "firms_with_any_price",
+    "firms_with_any_edgar",
+    "firms_with_snapshot_esg",
+    "panel_start_year",
+    "panel_end_year"
+  ),
+  value = c(
+    nrow(company_master),
+    n_distinct(company_master$cik),
+    n_distinct(final_panel$year),
+    nrow(final_panel),
+    n_distinct(final_panel$symbol[final_panel$price_available]),
+    n_distinct(final_panel$cik[final_panel$edgar_available]),
+    sum(company_master$snapshot_available, na.rm = TRUE),
+    START_YEAR,
+    END_YEAR
+  )
+)
+
+# ---- Company-level availability flags: which firms have data in any year? ----
+company_coverage_flags <- final_panel %>%
+  group_by(symbol, company_name, cik, gics_sector, gics_sub_industry) %>%
+  summarise(
+    any_price = any(price_available, na.rm = TRUE),
+    any_edgar = any(edgar_available, na.rm = TRUE),
+    snapshot_available = any(snapshot_available, na.rm = TRUE),
+    first_price_year = if (any(price_available, na.rm = TRUE)) min(year[price_available], na.rm = TRUE) else NA_integer_,
+    last_price_year = if (any(price_available, na.rm = TRUE)) max(year[price_available], na.rm = TRUE) else NA_integer_,
+    first_edgar_year = if (any(edgar_available, na.rm = TRUE)) min(year[edgar_available], na.rm = TRUE) else NA_integer_,
+    last_edgar_year = if (any(edgar_available, na.rm = TRUE)) max(year[edgar_available], na.rm = TRUE) else NA_integer_,
+    .groups = "drop"
+  )
+
+data.table::fwrite(coverage_by_year, OUTPUT_FILES$coverage_year)
+data.table::fwrite(coverage_overview, OUTPUT_FILES$coverage_overview)
+data.table::fwrite(company_coverage_flags, OUTPUT_FILES$coverage_company)
+
+coverage_overview %>% knitr::kable()
+coverage_by_year %>% knitr::kable()
+```
+
+
+## Output Files
+
+```{r outputs, results='asis'}
+output_table <- tibble(
+  file = to_project_relative(unname(c(unlist(OUTPUT_FILES), unlist(OUTPUT_USABILITY_FILES)))),
+  description = c(
+    "Current S&P 500 constituent master table with CIK, sector, and snapshot ESG",
+    "Raw cached table of current S&P 500 constituents from Wikipedia",
+    "Filtered daily price history for the S&P 500 universe",
+    "Annual price features aggregated from daily prices",
+    "Annual EDGAR ESG signal table aligned to the current S&P 500 universe",
+    "Final annual price + ESG panel",
+    "Coverage statistics by year",
+    "Overall coverage overview",
+    "Firm-level price/EDGAR coverage flags",
+    "Dual-denominator usability overview",
+    "Dual-denominator coverage by year",
+    "Dual-denominator coverage by sector",
+    "Field missingness summary for the main panel",
+    "Coverage distribution by firm-level usability bucket",
+    "Special sample and boundary-case summary",
+    "Line chart of dual-denominator coverage by year",
+    "Yearly bar chart for jointly available samples",
+    "Sector coverage heatmap",
+    "Field missingness bar chart",
+    "Firm coverage bucket distribution"
+  )
+)
+
+knitr::kable(output_table)
+```
+
+## Notes
+
+This section completes the reproducible data-foundation workflow:
+
+- Pulls the current S&P 500 constituent universe from Wikipedia.
+- Reuses the existing Yahoo Finance history cache to build daily prices and annual features.
+- Preserves the full cross-sectional ESG snapshot from `SP 500 ESG Risk Ratings.csv`.
+- Adds time-varying ESG signals from the pre-built EDGAR 10-K text cache.
+
+The panel `data/derived/sp500_price_esg_panel_2012_2023.csv` is the starting point for
+downstream work. The remaining sections of this notebook extend it with:
+
+1. **Data usability audits**: dual-denominator coverage analysis and missingness diagnostics.
+2. **Crash-risk labels**: `NCSKEW`, `CRASH_DUMMY`, and related metrics computed from weekly return residuals.
+3. **One-year and two-year machine learning warning systems**: full train/validate/test pipelines.
+
+## Data Usability Analysis
+
+The usability audit measures how complete the panel is under two denominator definitions:
+- **Full sample** (503 firms): all current constituents, regardless of when they joined the S&P 500
+- **Effective post-entry sample**: only firm-years after the company joined the index
+
+This dual view matters because a firm that joined the S&P 500 in 2020 cannot
+reasonably be expected to have historical data in 2012.
+
+### Prepare Usability Audit Data
+
+```{r usability-setup}
+# ---- Reload the merged panel with strict type coercion ----
+panel_for_usability <- readr::read_csv(
+  OUTPUT_FILES$panel,
+  show_col_types = FALSE
+) %>%
+   mutate(
+    year = as.integer(year),
+    date_added = suppressWarnings(as.Date(date_added)),
+    price_available = coalesce(as.logical(price_available), FALSE),
+    snapshot_available = coalesce(as.logical(snapshot_available), FALSE),
+    edgar_available = coalesce(as.logical(edgar_available), FALSE),
+    eligible_by_year = coalesce(as.logical(is_post_index_addition), TRUE),
+    price_and_snapshot = price_available & snapshot_available,
+    price_and_edgar = price_available & edgar_available,
+    has_cik = !is.na(cik) & stringr::str_trim(as.character(cik)) != "",
+    has_date_added = !is.na(date_added),
+    sector_standardized = dplyr::case_when(
+      gics_sector == "Technology" ~ "Information Technology",
+      gics_sector == "Healthcare" ~ "Health Care",
+      gics_sector == "Financial Services" ~ "Financials",
+      TRUE ~ gics_sector
+    )
+  )
+
+legacy_coverage_by_year <- readr::read_csv(
+  OUTPUT_FILES$coverage_year,
+  show_col_types = FALSE
+)
+
+company_flags_for_usability <- readr::read_csv(
+  OUTPUT_FILES$coverage_company,
+  show_col_types = FALSE
+) %>%
+  mutate(
+    any_price = coalesce(as.logical(any_price), FALSE),
+    any_edgar = coalesce(as.logical(any_edgar), FALSE),
+    snapshot_available = coalesce(as.logical(snapshot_available), FALSE),
+    has_cik = !is.na(cik) & stringr::str_trim(as.character(cik)) != ""
+  )
+
+# ---- Define the five coverage metrics tracked throughout the audit ----
+# "available" = the data source exists for that firm-year row
+# Joint metrics (price_and_snapshot, price_and_edgar) measure co-occurrence
+metric_levels <- c(
+  "price_available",
+  "snapshot_available",
+  "edgar_available",
+  "price_and_snapshot",
+  "price_and_edgar"
+)
+
+metric_labels <- c(
+  price_available = "Price Data",
+  snapshot_available = "Snapshot ESG",
+  edgar_available = "EDGAR ESG",
+  price_and_snapshot = "Price + Snapshot ESG",
+  price_and_edgar = "Price + EDGAR ESG"
+)
+
+denominator_labels <- c(
+  full_sample = "Full Sample (503 Firms)",
+  effective_sample = "Effective Post-Entry Sample"
+)
+
+metric_colors <- c(
+  "Price Data" = "#2F6DB3",
+  "Snapshot ESG" = "#2A9D55",
+  "EDGAR ESG" = "#E68613",
+  "Price + Snapshot ESG" = "#1F8A8A",
+  "Price + EDGAR ESG" = "#4D4D4D"
+)
+
+bucket_levels <- c(
+  "price+snapshot+edgar",
+  "price+snapshot",
+  "price+edgar",
+  "price_only",
+  "snapshot_only",
+  "none"
+)
+
+# ---- Classify each panel column into a logical field group for the missingness audit ----
+classify_panel_field_group <- function(field_name) {
+  dplyr::case_when(
+    field_name %in% c("symbol", "symbol_raw", "company_name", "cik", "gics_sector",
+                      "gics_sub_industry", "headquarters_location", "date_added",
+                      "founded", "year") ~ "company_static",
+    stringr::str_starts(field_name, "snapshot_") ~ "snapshot_esg",
+    field_name %in% c("n_trading_days", "first_trade", "last_trade", "start_price",
+                      "end_price", "annual_return", "annual_log_return",
+                      "annual_volatility", "avg_volume", "median_volume",
+                      "max_drawdown") ~ "price_features",
+    stringr::str_starts(field_name, "edgar_") ~ "edgar_esg",
+    field_name %in% c("price_available", "eligible_by_year", "price_and_snapshot",
+                      "price_and_edgar", "has_cik", "has_date_added",
+                      "is_post_index_addition", "panel_row_status",
+                      "sector_standardized") ~ "flags",
+    TRUE ~ "other"
+  )
+}
+
+# The full-sample denominator is always 503 (or the total distinct symbols in the panel)
+full_sample_denominator <- dplyr::n_distinct(panel_for_usability$symbol)
+```
+
+### Coverage Summary and CSV Export
+
+The dual-denominator coverage tables are built by pivoting the five availability
+indicators into long form and computing rates under both denominator definitions.
+
+```{r usability-tables}
+# ---- Pivot availability indicators to long format for grouped aggregation ----
+firm_year_metric_long <- panel_for_usability %>%
+  select(
+    year,
+    symbol,
+    sector_standardized,
+    eligible_by_year,
+    all_of(metric_levels)
+  ) %>%
+  pivot_longer(
+    cols = all_of(metric_levels),
+    names_to = "metric",
+    values_to = "available"
+  ) %>%
+   mutate(
+    available = coalesce(as.logical(available), FALSE),
+    metric = factor(metric, levels = metric_levels, ordered = TRUE),
+    metric_label = unname(metric_labels[as.character(metric)])
+  )
+
+# ---- Full-sample coverage: denominator = all 503 firms, every year ----
+coverage_by_year_full <- firm_year_metric_long %>%
+  group_by(year, metric, metric_label) %>%
+  summarise(
+    numerator = sum(available, na.rm = TRUE),
+    denominator = full_sample_denominator,
+    coverage_rate = numerator / denominator,
+    denominator_type = "full_sample",
+    .groups = "drop"
+  )
+
+# ---- Effective-sample coverage: denominator = only post-index-entry firm-years ----
+coverage_by_year_effective <- firm_year_metric_long %>%
+  filter(eligible_by_year) %>%
+  group_by(year, metric, metric_label) %>%
+  summarise(
+    numerator = sum(available, na.rm = TRUE),
+    denominator = n(),
+    coverage_rate = if_else(denominator > 0, numerator / denominator, NA_real_),
+    denominator_type = "effective_sample",
+    .groups = "drop"
+  )
+
+# ---- Combine full-sample and effective-sample into one dual-denominator table ----
+coverage_by_year_dual <- bind_rows(
+  coverage_by_year_full,
+  coverage_by_year_effective
+) %>%
+  mutate(
+    denominator_label = unname(denominator_labels[denominator_type])
+  ) %>%
+  arrange(denominator_type, year, metric)
+
+overall_coverage_dual <- bind_rows(
+  firm_year_metric_long %>%
+    group_by(metric, metric_label) %>%
+    summarise(
+      numerator = sum(available, na.rm = TRUE),
+      denominator = n(),
+      coverage_rate = numerator / denominator,
+      denominator_type = "full_sample",
+      .groups = "drop"
+    ),
+  firm_year_metric_long %>%
+    filter(eligible_by_year) %>%
+    group_by(metric, metric_label) %>%
+    summarise(
+      numerator = sum(available, na.rm = TRUE),
+      denominator = n(),
+      coverage_rate = if_else(denominator > 0, numerator / denominator, NA_real_),
+      denominator_type = "effective_sample",
+      .groups = "drop"
+    )
+) %>%
+  mutate(
+    summary_group = "coverage",
+    denominator_label = unname(denominator_labels[denominator_type])
+  )
+
+overview_base <- tibble(
+  summary_group = "base",
+  denominator_type = "not_applicable",
+  denominator_label = "Not Applicable",
+  metric = c(
+    "constituent_rows",
+    "years_in_panel",
+    "panel_rows",
+    "firms_with_any_price",
+    "firms_with_any_snapshot",
+    "firms_with_any_edgar",
+    "companies_missing_date_added",
+    "companies_missing_cik"
+  ),
+  metric_label = c(
+    "Number of Firms",
+    "Number of Years",
+    "Firm-Year Rows",
+    "Firms with Price Data in At Least One Year",
+    "Firms with Snapshot ESG",
+    "Firms with EDGAR ESG in At Least One Year",
+    "Firms Missing date_added",
+    "Firms Missing CIK"
+  ),
+  numerator = c(
+    dplyr::n_distinct(panel_for_usability$symbol),
+    dplyr::n_distinct(panel_for_usability$year),
+    nrow(panel_for_usability),
+    dplyr::n_distinct(panel_for_usability$symbol[panel_for_usability$price_available]),
+    dplyr::n_distinct(panel_for_usability$symbol[panel_for_usability$snapshot_available]),
+    dplyr::n_distinct(panel_for_usability$symbol[panel_for_usability$edgar_available]),
+    dplyr::n_distinct(panel_for_usability$symbol[!panel_for_usability$has_date_added]),
+    dplyr::n_distinct(panel_for_usability$symbol[!panel_for_usability$has_cik])
+  ),
+  denominator = NA_real_,
+  coverage_rate = NA_real_
+)
+
+overview_dual_denominator <- bind_rows(
+  overview_base,
+  overall_coverage_dual
+) %>%
+  arrange(summary_group, denominator_type, metric)
+
+coverage_by_sector_dual <- bind_rows(
+  firm_year_metric_long %>%
+    group_by(sector_standardized, metric, metric_label) %>%
+    summarise(
+      firms_in_sector = dplyr::n_distinct(symbol),
+      numerator = sum(available, na.rm = TRUE),
+      denominator = n(),
+      coverage_rate = if_else(denominator > 0, numerator / denominator, NA_real_),
+      denominator_type = "full_sample",
+      coverage_period = "all_years_avg",
+      .groups = "drop"
+    ),
+  firm_year_metric_long %>%
+    filter(eligible_by_year) %>%
+    group_by(sector_standardized, metric, metric_label) %>%
+    summarise(
+      firms_in_sector = dplyr::n_distinct(symbol),
+      numerator = sum(available, na.rm = TRUE),
+      denominator = n(),
+      coverage_rate = if_else(denominator > 0, numerator / denominator, NA_real_),
+      denominator_type = "effective_sample",
+      coverage_period = "all_years_avg",
+      .groups = "drop"
+    ),
+  firm_year_metric_long %>%
+    filter(year == END_YEAR) %>%
+    group_by(sector_standardized, metric, metric_label) %>%
+    summarise(
+      firms_in_sector = dplyr::n_distinct(symbol),
+      numerator = sum(available, na.rm = TRUE),
+      denominator = n(),
+      coverage_rate = if_else(denominator > 0, numerator / denominator, NA_real_),
+      denominator_type = "full_sample",
+      coverage_period = sprintf("year_%s", END_YEAR),
+      .groups = "drop"
+    ),
+  firm_year_metric_long %>%
+    filter(year == END_YEAR, eligible_by_year) %>%
+    group_by(sector_standardized, metric, metric_label) %>%
+    summarise(
+      firms_in_sector = dplyr::n_distinct(symbol),
+      numerator = sum(available, na.rm = TRUE),
+      denominator = n(),
+      coverage_rate = if_else(denominator > 0, numerator / denominator, NA_real_),
+      denominator_type = "effective_sample",
+      coverage_period = sprintf("year_%s", END_YEAR),
+      .groups = "drop"
+    )
+) %>%
+  mutate(
+    denominator_label = unname(denominator_labels[denominator_type])
+  ) %>%
+  arrange(coverage_period, denominator_type, sector_standardized, metric)
+
+# ---- Field-level missingness: how many NAs per column? ----
+field_missingness <- tibble(
+  field = names(panel_for_usability),
+  missing_count = purrr::map_int(names(panel_for_usability), ~ sum(is.na(panel_for_usability[[.x]]))),
+  missing_rate = purrr::map_dbl(names(panel_for_usability), ~ mean(is.na(panel_for_usability[[.x]])))
+) %>%
+  mutate(
+    non_missing_rate = 1 - missing_rate,
+    field_group = purrr::map_chr(field, classify_panel_field_group)
+  ) %>%
+  arrange(desc(missing_rate), field)
+
+# ---- Classify each company into one of six fixed coverage buckets ----
+company_coverage_buckets <- company_flags_for_usability %>%
+  mutate(
+    company_bucket = case_when(
+      any_price & snapshot_available & any_edgar ~ "price+snapshot+edgar",
+      any_price & snapshot_available & !any_edgar ~ "price+snapshot",
+      any_price & !snapshot_available & any_edgar ~ "price+edgar",
+      any_price & !snapshot_available & !any_edgar ~ "price_only",
+      !any_price & snapshot_available & !any_edgar ~ "snapshot_only",
+      TRUE ~ "none"
+    ),
+    company_bucket = factor(company_bucket, levels = bucket_levels, ordered = TRUE)
+  ) %>%
+  count(company_bucket, name = "company_count", .drop = FALSE) %>%
+  mutate(
+    share = company_count / sum(company_count),
+    company_bucket = as.character(company_bucket)
+  )
+
+# ---- Document boundary cases: missing identifiers, edge firms, ineligible rows ----
+special_cases_summary <- tibble(
+  scope = c(
+    "company",
+    "company",
+    "company",
+    "company",
+    "company",
+    "company",
+    "company",
+    "firm_year"
+  ),
+  metric = c(
+    "companies_missing_date_added",
+    "companies_missing_cik",
+    "companies_without_any_price",
+    "companies_without_any_snapshot",
+    "companies_without_any_edgar",
+    "companies_with_edgar_but_no_price",
+    "companies_bucketed_as_none",
+    "firm_years_not_eligible_by_year"
+  ),
+  value = c(
+    dplyr::n_distinct(panel_for_usability$symbol[!panel_for_usability$has_date_added]),
+    dplyr::n_distinct(panel_for_usability$symbol[!panel_for_usability$has_cik]),
+    sum(!company_flags_for_usability$any_price, na.rm = TRUE),
+    sum(!company_flags_for_usability$snapshot_available, na.rm = TRUE),
+    sum(!company_flags_for_usability$any_edgar, na.rm = TRUE),
+    sum(company_flags_for_usability$any_edgar & !company_flags_for_usability$any_price, na.rm = TRUE),
+    company_coverage_buckets$company_count[company_coverage_buckets$company_bucket == "none"],
+    sum(!panel_for_usability$eligible_by_year, na.rm = TRUE)
+  ),
+  note = c(
+    "Firms missing date_added are retained in the effective-sample denominator by default",
+    "Missing CIK affects the interpretation of downstream EDGAR matching",
+    "No company-level observation ever has price_available = TRUE",
+    "No company-level observation ever has snapshot_available = TRUE",
+    "No company-level observation ever has edgar_available = TRUE",
+    "These firms are folded into the none bucket",
+    "Fallback category within the fixed six coverage buckets",
+    "These observations enter the denominator only under the full_sample definition"
+  )
+)
+
+data.table::fwrite(overview_dual_denominator, OUTPUT_USABILITY_FILES$overview)
+data.table::fwrite(coverage_by_year_dual, OUTPUT_USABILITY_FILES$coverage_year)
+data.table::fwrite(coverage_by_sector_dual, OUTPUT_USABILITY_FILES$coverage_sector)
+data.table::fwrite(field_missingness, OUTPUT_USABILITY_FILES$field_missingness)
+data.table::fwrite(company_coverage_buckets, OUTPUT_USABILITY_FILES$company_buckets)
+data.table::fwrite(special_cases_summary, OUTPUT_USABILITY_FILES$special_cases)
+
+overview_dual_denominator %>%
+  filter(summary_group == "base") %>%
+  select(metric_label, numerator) %>%
+  knitr::kable()
+
+coverage_by_year_dual %>%
+  filter(metric %in% c("price_available", "snapshot_available", "edgar_available")) %>%
+  select(year, denominator_label, metric_label, numerator, denominator, coverage_rate) %>%
+  head(12) %>%
+  knitr::kable()
+```
+
+### Visualization Outputs
+
+```{r usability-plots, fig.width=10, fig.height=6}
+yearly_coverage_plot <- coverage_by_year_dual %>%
+  ggplot(aes(x = year, y = coverage_rate, color = metric_label, group = metric_label)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.8) +
+  facet_wrap(~ denominator_label, ncol = 1) +
+  scale_color_manual(values = metric_colors) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "S&P 500 Coverage Rates (Dual Denominator)",
+    subtitle = "Showing both the full sample of 503 firms and the effective post-entry sample",
+    x = "Year",
+    y = "Coverage Rate",
+    color = "Data Type"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+joint_coverage_bar_plot <- coverage_by_year_dual %>%
+  filter(
+    denominator_type == "effective_sample",
+    metric %in% c("price_and_snapshot", "price_and_edgar")
+  ) %>%
+  ggplot(aes(x = factor(year), y = coverage_rate, fill = metric_label)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_fill_manual(values = metric_colors[c("Price + Snapshot ESG", "Price + EDGAR ESG")]) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Coverage of Jointly Available Samples",
+    subtitle = "Effective post-entry sample definition",
+    x = "Year",
+    y = "Coverage Rate",
+    fill = "Joint Sample Type"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+sector_heatmap_data <- coverage_by_sector_dual %>%
+  filter(
+    denominator_type == "effective_sample",
+    coverage_period == "all_years_avg"
+  ) %>%
+  group_by(sector_standardized) %>%
+  mutate(
+    edgar_sort = coverage_rate[metric == "edgar_available"][1]
+  ) %>%
+  ungroup() %>%
+  mutate(
+    sector_standardized = reorder(sector_standardized, edgar_sort, na.rm = TRUE),
+    metric_label = factor(metric_label, levels = unname(metric_labels), ordered = TRUE)
+  )
+
+sector_heatmap_plot <- sector_heatmap_data %>%
+  ggplot(aes(x = metric_label, y = sector_standardized, fill = coverage_rate)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = ifelse(is.na(coverage_rate), "NA", scales::percent(coverage_rate, accuracy = 1))), size = 3) +
+  scale_fill_gradient(low = "#F1F5F9", high = "#2F6DB3", labels = scales::percent_format(accuracy = 1), na.value = "#D9D9D9") +
+  labs(
+    title = "Sector-Level Coverage Heatmap",
+    subtitle = "Effective post-entry sample definition using average coverage across the full period",
+    x = "Data Type",
+    y = "Standardized Sector",
+    fill = "Coverage Rate"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+field_missingness_plot <- field_missingness %>%
+  mutate(field = reorder(field, missing_rate)) %>%
+  ggplot(aes(x = field, y = missing_rate, fill = field_group)) +
+  geom_col(width = 0.75) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Main Panel Field Missingness",
+    subtitle = "Missingness rates grouped by field family",
+    x = "Field",
+    y = "Missing Rate",
+    fill = "Field Group"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_text(size = 9)) +
+  coord_flip()
+
+bucket_plot <- company_coverage_buckets %>%
+  mutate(company_bucket = factor(company_bucket, levels = bucket_levels, ordered = TRUE)) %>%
+  ggplot(aes(x = company_bucket, y = company_count, fill = company_bucket)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = scales::percent(share, accuracy = 0.1)), vjust = -0.4, size = 3.5) +
+  labs(
+    title = "Firm Coverage Bucket Distribution",
+    subtitle = "Main usability combinations aggregated at the firm level",
+    x = "Coverage Bucket",
+    y = "Number of Firms"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 18, hjust = 1))
+
+ggplot2::ggsave(OUTPUT_USABILITY_FILES$yearly_lines, yearly_coverage_plot, width = 10, height = 7, dpi = 160)
+ggplot2::ggsave(OUTPUT_USABILITY_FILES$joint_bars, joint_coverage_bar_plot, width = 10, height = 6, dpi = 160)
+ggplot2::ggsave(OUTPUT_USABILITY_FILES$sector_heatmap, sector_heatmap_plot, width = 11, height = 7.5, dpi = 160)
+ggplot2::ggsave(OUTPUT_USABILITY_FILES$missingness_bar, field_missingness_plot, width = 11, height = 10, dpi = 160)
+ggplot2::ggsave(OUTPUT_USABILITY_FILES$bucket_bar, bucket_plot, width = 10, height = 6, dpi = 160)
+
+yearly_coverage_plot
+```
+
+### Audit Validation Checks
+
+Assert invariants that must hold for the audit tables to be internally consistent:
+- Denominators match expected counts
+- Coverage rates are bounded in [0, 1]
+- Joint coverage never exceeds the min of its components
+- Snapshot coverage is constant across years (cross-sectional source)
+- Sector labels have been standardized
+- New dual-denominator definitions match legacy single-denominator figures
+
+```{r usability-validation}
+# ---- Cross-check new coverage definitions against legacy outputs ----
+legacy_compare <- coverage_by_year_dual %>%
+  filter(
+    denominator_type == "full_sample",
+    metric %in% c("price_available", "snapshot_available", "edgar_available")
+  ) %>%
+  select(year, metric, coverage_rate) %>%
+  pivot_wider(names_from = metric, values_from = coverage_rate) %>%
+  left_join(
+    legacy_coverage_by_year %>%
+      select(year, price_coverage, snapshot_coverage, edgar_coverage),
+    by = "year"
+  )
+
+joint_edgar_check <- coverage_by_year_dual %>%
+  select(year, denominator_type, metric, coverage_rate) %>%
+  pivot_wider(names_from = metric, values_from = coverage_rate) %>%
+  transmute(check = price_and_edgar <= pmin(price_available, edgar_available)) %>%
+  pull(check)
+
+joint_snapshot_check <- coverage_by_year_dual %>%
+  select(year, denominator_type, metric, coverage_rate) %>%
+  pivot_wider(names_from = metric, values_from = coverage_rate) %>%
+  transmute(check = price_and_snapshot <= pmin(price_available, snapshot_available)) %>%
+  pull(check)
+
+stopifnot(all(coverage_by_year_dual$denominator[coverage_by_year_dual$denominator_type == "full_sample"] == 503))
+stopifnot(all(coverage_by_year_dual$denominator[coverage_by_year_dual$denominator_type == "effective_sample"] <= 503))
+stopifnot(all(coverage_by_year_dual$coverage_rate[!is.na(coverage_by_year_dual$coverage_rate)] >= 0))
+stopifnot(all(coverage_by_year_dual$coverage_rate[!is.na(coverage_by_year_dual$coverage_rate)] <= 1))
+stopifnot(all(coverage_by_year_dual$coverage_rate[!is.na(coverage_by_year_dual$coverage_rate)] %>% is.finite()))
+stopifnot(all(joint_edgar_check[!is.na(joint_edgar_check)]))
+stopifnot(all(joint_snapshot_check[!is.na(joint_snapshot_check)]))
+stopifnot(
+  dplyr::n_distinct(
+    coverage_by_year_dual$coverage_rate[
+      coverage_by_year_dual$denominator_type == "full_sample" &
+        coverage_by_year_dual$metric == "snapshot_available"
+    ]
+  ) == 1
+)
+stopifnot(!any(panel_for_usability$sector_standardized %in% c("Technology", "Healthcare", "Financial Services"), na.rm = TRUE))
+stopifnot(all(round(legacy_compare$price_available, 4) == round(legacy_compare$price_coverage, 4)))
+stopifnot(all(round(legacy_compare$snapshot_available, 4) == round(legacy_compare$snapshot_coverage, 4)))
+stopifnot(all(round(legacy_compare$edgar_available, 4) == round(legacy_compare$edgar_coverage, 4)))
+
+validation_summary <- tibble(
+  check = c(
+    "Full-sample denominator is always 503",
+    "Effective-sample denominator never exceeds 503",
+    "All coverage rates lie within [0, 1]",
+    "Joint coverage never exceeds single-source coverage",
+    "Snapshot annual coverage is constant",
+    "Sector labels are standardized",
+    "New and legacy yearly coverage definitions match"
+  ),
+  result = "PASS"
+)
+
+knitr::kable(validation_summary)
+```
+
+### Usability Analysis Output Files
+
+```{r usability-output-files}
+usability_output_table <- tibble(
+  file = to_project_relative(unname(unlist(OUTPUT_USABILITY_FILES))),
+  description = c(
+    "Dual-denominator usability overview",
+    "Dual-denominator coverage by year",
+    "Dual-denominator coverage by sector",
+    "Field missingness summary for the main panel",
+    "Coverage distribution by firm-level usability bucket",
+    "Special sample and boundary-case summary",
+    "Line chart of dual-denominator coverage by year",
+    "Yearly bar chart for jointly available samples",
+    "Sector coverage heatmap",
+    "Field missingness bar chart",
+    "Firm coverage bucket distribution"
+  )
+)
+
+knitr::kable(usability_output_table)
+```
+
+## Machine Learning Helper Functions
+
+Shared functions for crash-label construction, classification metrics, feature
+preprocessing, and model fitting. Used by the two-year crash-risk warning pipeline
+in the next section.
+
+```{r ml-warning-helpers}
+# ---------------------------------------------------------------------------
+# Python fallback for Yahoo Finance price downloads
+# ---------------------------------------------------------------------------
+# When cached price files are missing, we call a Python script that uses
+# Yahoo Finance's chart API. R's quantmod/tidyquant can be unreliable for
+# bulk downloads, hence the Python fallback.
+
+detect_workspace_python <- function() {
+  candidates <- c(
+    file.path(Sys.getenv("USERPROFILE"), ".cache", "codex-runtimes", "codex-primary-runtime", "dependencies", "python", "python.exe"),
+    Sys.which("python")
+  )
+
+  valid_candidates <- candidates[nzchar(candidates) & file.exists(candidates)]
+  if (length(valid_candidates) == 0) {
+    return(NA_character_)
+  }
+
+  valid_candidates[[1]]
+}
+
+fetch_yahoo_prices_python <- function(tickers, start_date, end_date_exclusive, output_file) {
+  python_path <- detect_workspace_python()
+
+  if (is.na(python_path) || !file.exists(python_path)) {
+    stop("No accessible Python runtime was found for the Yahoo Finance fallback.")
+  }
+
+  tickers <- unique(tickers[!is.na(tickers) & nzchar(tickers)])
+  tickers_file <- tempfile(fileext = ".txt")
+  script_file <- tempfile(fileext = ".py")
+  writeLines(tickers, tickers_file, useBytes = TRUE)
+
+  script_lines <- c(
+    "import csv",
+    "import json",
+    "import sys",
+    "import time",
+    "import urllib.parse",
+    "import urllib.request",
+    "from concurrent.futures import ThreadPoolExecutor, as_completed",
+    "from datetime import datetime, timezone",
+    "",
+    "tickers_file, output_file, start_date, end_date = sys.argv[1:5]",
+    "with open(tickers_file, 'r', encoding='utf-8') as handle:",
+    "    tickers = [line.strip() for line in handle if line.strip()]",
+    "",
+    "period1 = int(datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc).timestamp())",
+    "period2 = int(datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc).timestamp())",
+    "headers = {'User-Agent': 'Mozilla/5.0'}",
+    "",
+    "def fetch_one(ticker):",
+    "    encoded_ticker = urllib.parse.quote(ticker)",
+    "    url = f'https://query2.finance.yahoo.com/v8/finance/chart/{encoded_ticker}?period1={period1}&period2={period2}&interval=1d&events=div%2Csplits&includeAdjustedClose=true'",
+    "    last_error = None",
+    "    for attempt in range(3):",
+    "        try:",
+    "            request = urllib.request.Request(url, headers=headers)",
+    "            with urllib.request.urlopen(request, timeout=30) as response:",
+    "                payload = json.loads(response.read().decode('utf-8'))",
+    "            result = (payload.get('chart', {}) or {}).get('result')",
+    "            if not result:",
+    "                return ticker, [], str((payload.get('chart', {}) or {}).get('error'))",
+    "            result = result[0]",
+    "            timestamps = result.get('timestamp') or []",
+    "            indicators = result.get('indicators') or {}",
+    "            quote = (indicators.get('quote') or [{}])[0]",
+    "            adj_block = (indicators.get('adjclose') or [{}])[0]",
+    "            adj_values = adj_block.get('adjclose')",
+    "            if adj_values is None:",
+    "                adj_values = quote.get('close') or []",
+    "            volume_values = quote.get('volume') or []",
+    "            rows = []",
+    "            for idx, one_timestamp in enumerate(timestamps):",
+    "                adj_value = adj_values[idx] if idx < len(adj_values) else None",
+    "                volume_value = volume_values[idx] if idx < len(volume_values) else None",
+    "                if adj_value is None:",
+    "                    continue",
+    "                date_value = datetime.utcfromtimestamp(one_timestamp).strftime('%Y-%m-%d')",
+    "                rows.append([ticker, date_value, adj_value, '' if volume_value is None else volume_value])",
+    "            return ticker, rows, None",
+    "        except Exception as error:",
+    "            last_error = str(error)",
+    "            time.sleep(0.8 * (attempt + 1))",
+    "    return ticker, [], last_error",
+    "",
+    "all_rows = []",
+    "failures = []",
+    "with ThreadPoolExecutor(max_workers=8) as executor:",
+    "    futures = {executor.submit(fetch_one, ticker): ticker for ticker in tickers}",
+    "    for future in as_completed(futures):",
+    "        ticker, rows, error_message = future.result()",
+    "        if rows:",
+    "            all_rows.extend(rows)",
+    "        else:",
+    "            failures.append((ticker, error_message))",
+    "",
+    "with open(output_file, 'w', newline='', encoding='utf-8') as handle:",
+    "    writer = csv.writer(handle)",
+    "    writer.writerow(['price_symbol', 'date', 'adj_close', 'volume'])",
+    "    writer.writerows(all_rows)",
+    "",
+    "if failures:",
+    "    sys.stderr.write('Failed tickers: ' + str(len(failures)) + '\\n')",
+    "    preview = '; '.join([f'{ticker}={message}' for ticker, message in failures[:10]])",
+    "    sys.stderr.write(preview + '\\n')",
+    "",
+    "sys.stdout.write(str(len(all_rows)))"
+  )
+
+  writeLines(script_lines, script_file, useBytes = TRUE)
+
+  command_output <- system2(
+    command = python_path,
+    args = c(script_file, tickers_file, output_file, start_date, end_date_exclusive),
+    stdout = TRUE,
+    stderr = TRUE
+  )
+
+  if (!file.exists(output_file)) {
+    stop("The Python Yahoo download fallback did not create the expected price file.")
+  }
+
+  command_output
+}
+
+# ---------------------------------------------------------------------------
+# Crash-risk label construction (following Chen, Hong & Stein 2001 / JFE)
+# ---------------------------------------------------------------------------
+# Crash metrics are computed from weekly residual returns after removing
+# market-wide movements. The key steps:
+#   1. Aggregate daily log returns to weekly
+#   2. Regress firm weekly returns on lead/lag market returns (Dimson 1979)
+#   3. Compute NCSKEW (negative conditional skewness) and CRASH_DUMMY from residuals
+# A "crash" week is any residual return below mean - 3.09 * sd (~0.1% tail).
+
+compute_symbol_year_crash_metrics <- function(firm_data) {
+  n_obs <- nrow(firm_data)
+  if (n_obs < 26) {
+    return(NULL)
+  }
+
+  firm_sorted <- firm_data %>%
+    arrange(week_id) %>%
+    mutate(
+      mkt_lag2 = lag(ret_market, 2),
+      mkt_lag1 = lag(ret_market, 1),
+      mkt_lead1 = lead(ret_market, 1),
+      mkt_lead2 = lead(ret_market, 2)
+    )
+
+  reg_data <- firm_sorted %>%
+    filter(
+      !is.na(mkt_lag2), !is.na(mkt_lag1),
+      !is.na(ret_market), !is.na(mkt_lead1), !is.na(mkt_lead2)
+    )
+
+  if (nrow(reg_data) < 20) {
+    return(NULL)
+  }
+
+  # Regress firm weekly returns on lead/lag market returns to isolate firm-specific residual moves.
+  fit <- tryCatch(
+    lm(ret_week ~ mkt_lag2 + mkt_lag1 + ret_market + mkt_lead1 + mkt_lead2, data = reg_data),
+    error = function(error) NULL
+  )
+
+  if (is.null(fit)) {
+    return(NULL)
+  }
+
+  residual_returns <- residuals(fit)
+  transformed_returns <- log(1 + residual_returns)
+  transformed_returns <- transformed_returns[is.finite(transformed_returns)]
+
+  n <- length(transformed_returns)
+  if (n < 20) {
+    return(NULL)
+  }
+
+  sum_w3 <- sum(transformed_returns^3)
+  sum_w2 <- sum(transformed_returns^2)
+
+  ncskew <- NA_real_
+  if (sum_w2 > 0) {
+    ncskew <- -(n * (n - 1)^(1.5) * sum_w3) / ((n - 1) * (n - 2) * sum_w2^(1.5))
+  }
+
+  w_mean <- mean(transformed_returns, na.rm = TRUE)
+  w_sd <- sd(transformed_returns, na.rm = TRUE)
+  # A crash year is flagged when at least one residual return breaches the 3.09-standard-deviation cutoff.
+  crash_dummy <- as.integer(any(transformed_returns < w_mean - 3.09 * w_sd, na.rm = TRUE))
+
+  tibble(
+    NCSKEW = ncskew,
+    CRASH_DUMMY = crash_dummy,
+    SIGMA = w_sd,
+    RET_MEAN = w_mean
+  )
+}
+
+build_sp500_crash_metrics <- function(price_data) {
+  # Build weekly firm and market returns because the crash-risk labels are defined on weekly residuals.
+  daily_returns <- price_data %>%
+    arrange(symbol, date) %>%
+    group_by(symbol) %>%
+    mutate(ret_daily = log(adj_close / lag(adj_close))) %>%
+    ungroup() %>%
+    filter(!is.na(ret_daily), is.finite(ret_daily))
+
+  market_daily <- daily_returns %>%
+    group_by(date) %>%
+    summarise(
+      ret_market = mean(ret_daily, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  daily_with_week <- daily_returns %>%
+    left_join(market_daily, by = "date") %>%
+    mutate(
+      year = lubridate::year(date),
+      week_id = paste0(year, "_W", sprintf("%02d", lubridate::isoweek(date)))
+    )
+
+  weekly_returns <- daily_with_week %>%
+    group_by(symbol, year, week_id) %>%
+    summarise(
+      ret_week = sum(ret_daily, na.rm = TRUE),
+      ret_market = sum(ret_market, na.rm = TRUE),
+      avg_volume = mean(volume, na.rm = TRUE),
+      n_days = n(),
+      .groups = "drop"
+    ) %>%
+    filter(n_days >= 3)
+
+  symbol_year_groups <- weekly_returns %>%
+    group_by(symbol, year) %>%
+    group_split()
+
+  crash_rows <- lapply(symbol_year_groups, function(group_data) {
+    metric_row <- compute_symbol_year_crash_metrics(group_data)
+    if (is.null(metric_row)) {
+      return(NULL)
+    }
+
+    bind_cols(
+      tibble(symbol = group_data$symbol[[1]], year = group_data$year[[1]]),
+      metric_row
+    )
+  })
+
+  crash_metrics_df <- bind_rows(Filter(Negate(is.null), crash_rows))
+
+  monthly_volume <- daily_returns %>%
+    mutate(
+      year = lubridate::year(date),
+      month = lubridate::month(date)
+    ) %>%
+    group_by(symbol, year, month) %>%
+    summarise(
+      monthly_volume = sum(volume, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  annual_volume <- monthly_volume %>%
+    group_by(symbol, year) %>%
+    summarise(
+      avg_monthly_volume = mean(monthly_volume, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # DTURN captures the year-over-year change in average monthly trading volume.
+  dturn_df <- annual_volume %>%
+    arrange(symbol, year) %>%
+    group_by(symbol) %>%
+    mutate(DTURN = avg_monthly_volume - lag(avg_monthly_volume)) %>%
+    ungroup() %>%
+    select(symbol, year, DTURN)
+
+  crash_metrics_df %>%
+    left_join(dturn_df, by = c("symbol", "year")) %>%
+    arrange(symbol, year)
+}
+
+# ---------------------------------------------------------------------------
+# Classification metrics (all handle NA values via valid_index filtering)
+# ---------------------------------------------------------------------------
+# ROC AUC computed via the Wilcoxon-Mann-Whitney rank-sum formula
+
+calc_roc_auc <- function(truth, probability) {
+  truth <- as.integer(truth)
+  valid_index <- !is.na(truth) & !is.na(probability)
+  truth <- truth[valid_index]
+  probability <- probability[valid_index]
+
+  positive_total <- sum(truth == 1)
+  negative_total <- sum(truth == 0)
+
+  if (positive_total == 0 || negative_total == 0) {
+    return(NA_real_)
+  }
+
+  ranks <- rank(probability, ties.method = "average")
+  positive_rank_sum <- sum(ranks[truth == 1])
+
+  (positive_rank_sum - positive_total * (positive_total + 1) / 2) / (positive_total * negative_total)
+}
+
+# PR AUC via the trapezoidal rule on sorted predictions
+calc_pr_auc <- function(truth, probability) {
+  truth <- as.integer(truth)
+  valid_index <- !is.na(truth) & !is.na(probability)
+  truth <- truth[valid_index]
+  probability <- probability[valid_index]
+
+  positive_total <- sum(truth == 1)
+  if (positive_total == 0) {
+    return(NA_real_)
+  }
+
+  order_index <- order(probability, decreasing = TRUE)
+  sorted_truth <- truth[order_index]
+  true_positive <- cumsum(sorted_truth == 1)
+  false_positive <- cumsum(sorted_truth == 0)
+  precision <- true_positive / (true_positive + false_positive)
+  recall <- true_positive / positive_total
+  precision <- c(1, precision)
+  recall <- c(0, recall)
+
+  sum((recall[-1] - recall[-length(recall)]) * precision[-1], na.rm = TRUE)
+}
+
+# F-beta score with beta = 0.5 (weights precision 2× more than recall).
+# We prioritize precision because flagging too many non-crash firms as "high risk"
+# erodes the credibility of the warning system more than missing a few crashes.
+calc_fbeta <- function(precision, recall, beta_weight = 0.5) {
+  if (is.na(precision) || is.na(recall) || (precision + recall) == 0) {
+    return(NA_real_)
+  }
+
+  beta_square <- beta_weight ^ 2
+  (1 + beta_square) * precision * recall / (beta_square * precision + recall)
+}
+
+calc_precision_at_top_share <- function(truth, probability, share = 0.10) {
+  truth <- as.integer(truth)
+  valid_index <- !is.na(truth) & !is.na(probability)
+  truth <- truth[valid_index]
+  probability <- probability[valid_index]
+
+  if (length(truth) == 0) {
+    return(NA_real_)
+  }
+
+  k <- max(1, ceiling(length(truth) * share))
+  order_index <- order(probability, decreasing = TRUE)
+  mean(truth[order_index[seq_len(k)]] == 1)
+}
+
+calc_top_n_hit_summary <- function(truth, probability, top_n = 20) {
+  truth <- as.integer(truth)
+  valid_index <- !is.na(truth) & !is.na(probability)
+  truth <- truth[valid_index]
+  probability <- probability[valid_index]
+
+  if (length(truth) == 0) {
+    return(list(rate = NA_real_, hits = NA_integer_, k = 0L))
+  }
+
+  k <- min(top_n, length(truth))
+  order_index <- order(probability, decreasing = TRUE)
+  hits <- sum(truth[order_index[seq_len(k)]] == 1)
+
+  list(
+    rate = hits / k,
+    hits = hits,
+    k = k
+  )
+}
+
+build_pr_curve_data <- function(actual, probability, model_label) {
+  valid_index <- !is.na(actual) & !is.na(probability)
+  actual <- as.integer(actual[valid_index])
+  probability <- as.numeric(probability[valid_index])
+
+  if (length(actual) == 0 || sum(actual == 1) == 0) {
+    return(tibble())
+  }
+
+  order_index <- order(probability, decreasing = TRUE)
+  sorted_truth <- actual[order_index]
+  sorted_probability <- probability[order_index]
+  true_positive <- cumsum(sorted_truth == 1)
+  false_positive <- cumsum(sorted_truth == 0)
+  positive_total <- sum(sorted_truth == 1)
+
+  tibble(
+    model_label = model_label,
+    step = seq_along(sorted_probability),
+    threshold = sorted_probability,
+    precision = true_positive / (true_positive + false_positive),
+    recall = true_positive / positive_total
+  )
+}
+
+choose_threshold_from_validation <- function(threshold_table) {
+  threshold_table %>%
+    mutate(
+      rank_f0_5 = dplyr::dense_rank(desc(mean_f0_5)),
+      rank_precision = dplyr::dense_rank(desc(mean_precision))
+    ) %>%
+    arrange(rank_f0_5, rank_precision, desc(mean_pr_auc_proxy), threshold) %>%
+    slice(1) %>%
+    select(-rank_f0_5, -rank_precision)
+}
+
+# ---- Feature preprocessing ----
+# Prepares feature matrices for model fitting:
+#   - Continuous features: median-impute NAs, optionally standardize (z-score)
+#   - Binary features (missingness flags, availability dummies): impute NAs to 0
+# Median imputation is used (rather than mean) because it's robust to outliers in
+# financial variables like volume and drawdown.
+
+build_model_frame <- function(train_data, apply_data, feature_cols, binary_features = character(), standardize = FALSE) {
+  train_frame <- train_data %>%
+    select(all_of(feature_cols)) %>%
+    mutate(across(everything(), as.numeric))
+
+  apply_frame <- apply_data %>%
+    select(all_of(feature_cols)) %>%
+    mutate(across(everything(), as.numeric))
+
+  binary_features <- intersect(binary_features, feature_cols)
+  continuous_features <- setdiff(feature_cols, binary_features)
+
+  if (length(binary_features) > 0) {
+    for (feature_name in binary_features) {
+      train_frame[[feature_name]][is.na(train_frame[[feature_name]])] <- 0
+      apply_frame[[feature_name]][is.na(apply_frame[[feature_name]])] <- 0
+    }
+  }
+
+  if (length(continuous_features) > 0) {
+    for (feature_name in continuous_features) {
+      median_value <- median(train_frame[[feature_name]], na.rm = TRUE)
+      if (!is.finite(median_value)) {
+        median_value <- 0
+      }
+
+      train_frame[[feature_name]][is.na(train_frame[[feature_name]])] <- median_value
+      apply_frame[[feature_name]][is.na(apply_frame[[feature_name]])] <- median_value
+
+      if (standardize) {
+        mean_value <- mean(train_frame[[feature_name]], na.rm = TRUE)
+        sd_value <- sd(train_frame[[feature_name]], na.rm = TRUE)
+        if (!is.finite(sd_value) || sd_value == 0) {
+          sd_value <- 1
+        }
+
+        train_frame[[feature_name]] <- (train_frame[[feature_name]] - mean_value) / sd_value
+        apply_frame[[feature_name]] <- (apply_frame[[feature_name]] - mean_value) / sd_value
+      }
+    }
+  }
+
+  list(
+    train = train_frame,
+    apply = apply_frame
+  )
+}
+
+
+```
+
+## Machine Learning Risk Warning — Two-Year External Validation
+
+The two-year warning extends the one-year setup with a longer forecast window:
+a firm is flagged if it crashes in **either** of the next two years. This
+reduces false negatives at the cost of more false positives, which may be
+acceptable for screening systems that prioritize recall over precision.
+
+The pipeline mirrors the one-year structure but with:
+- Two-year labels: `future_2y_crash_dummy = crash_t1 | crash_t2`
+- Two-year price extensions (2024 + 2025 fetched)
+- Feature-year CV instead of target-year CV
+- Confusion matrix outputs for all models
+
+### Two-Year Machine Learning Helper Functions
+```{r ml-warning-2y-helpers}
+# ---- Standardize raw Yahoo Finance CSV into the canonical price format ----
+standardize_warning_price_frame <- function(price_raw, price_map) {
+  price_raw <- price_raw %>%
+    mutate(
+      price_symbol = as.character(price_symbol),
+      date = as.Date(date),
+      adj_close = as.numeric(adj_close),
+      volume = as.numeric(volume)
+    ) %>%
+    filter(!is.na(adj_close))
+
+  price_has_metadata <- all(
+    c("symbol", "company_name", "cik", "gics_sector", "gics_sub_industry") %in% names(price_raw)
+  )
+
+  if (price_has_metadata) {
+    price_raw %>%
+      transmute(
+        price_symbol = price_symbol,
+        date = date,
+        adj_close = adj_close,
+        volume = volume,
+        symbol = as.character(symbol),
+        company_name = as.character(company_name),
+        cik = cik,
+        gics_sector = as.character(gics_sector),
+        gics_sub_industry = as.character(gics_sub_industry)
+      ) %>%
+      arrange(symbol, date)
+  } else {
+    price_raw %>%
+      select(price_symbol, date, adj_close, volume) %>%
+      inner_join(price_map, by = c("price_symbol" = "symbol")) %>%
+      transmute(
+        price_symbol = price_symbol,
+        date = date,
+        adj_close = adj_close,
+        volume = volume,
+        symbol = price_symbol,
+        company_name = as.character(company_name),
+        cik = cik,
+        gics_sector = as.character(gics_sector),
+        gics_sub_industry = as.character(gics_sub_industry)
+      ) %>%
+      arrange(symbol, date)
+  }
+}
+
+# ---- Fetch or load a single year of daily prices, caching to CSV ----
+ensure_warning_price_year <- function(year_value, output_file, price_map, force_refresh = FALSE) {
+  start_date <- sprintf("%d-01-01", year_value)
+  end_date_exclusive <- sprintf("%d-01-01", year_value + 1L)
+
+  if (!file.exists(output_file) || force_refresh) {
+    message(sprintf(">>> Fetching %d daily prices through the Python Yahoo Finance fallback", year_value))
+    fetch_log <- fetch_yahoo_prices_python(
+      tickers = price_map$symbol,
+      start_date = start_date,
+      end_date_exclusive = end_date_exclusive,
+      output_file = output_file
+    )
+    message(paste(fetch_log, collapse = "\n"))
+  }
+
+  standardized_prices <- readr::read_csv(output_file, show_col_types = FALSE) %>%
+    standardize_warning_price_frame(price_map = price_map)
+
+  data.table::fwrite(standardized_prices, output_file)
+  standardized_prices
+}
+
+calc_classification_metrics <- function(actual, probability, threshold = 0.5) {
+  valid_index <- !is.na(actual) & !is.na(probability)
+  actual <- as.integer(actual[valid_index])
+  probability <- as.numeric(probability[valid_index])
+
+  if (length(actual) == 0) {
+    return(tibble())
+  }
+
+  predicted_class <- ifelse(probability >= threshold, 1L, 0L)
+  true_positive <- sum(predicted_class == 1 & actual == 1)
+  true_negative <- sum(predicted_class == 0 & actual == 0)
+  false_positive <- sum(predicted_class == 1 & actual == 0)
+  false_negative <- sum(predicted_class == 0 & actual == 1)
+
+  precision <- if ((true_positive + false_positive) == 0) NA_real_ else true_positive / (true_positive + false_positive)
+  recall <- if ((true_positive + false_negative) == 0) NA_real_ else true_positive / (true_positive + false_negative)
+  specificity <- if ((true_negative + false_positive) == 0) NA_real_ else true_negative / (true_negative + false_positive)
+  balanced_accuracy <- if (all(is.na(c(recall, specificity)))) {
+    NA_real_
+  } else {
+    mean(c(recall, specificity), na.rm = TRUE)
+  }
+  top20_summary <- calc_top_n_hit_summary(actual, probability, top_n = 20)
+
+  tibble(
+    selected_threshold = threshold,
+    n_eval = length(actual),
+    positive_count = sum(actual == 1),
+    positive_rate = mean(actual == 1),
+    predicted_positive_count = sum(predicted_class == 1),
+    accuracy = (true_positive + true_negative) / length(actual),
+    balanced_accuracy = balanced_accuracy,
+    precision = precision,
+    recall = recall,
+    specificity = specificity,
+    f0_5 = calc_fbeta(precision, recall, beta_weight = 0.5),
+    roc_auc = calc_roc_auc(actual, probability),
+    pr_auc = calc_pr_auc(actual, probability),
+    precision_at_top10 = calc_precision_at_top_share(actual, probability, share = 0.10),
+    top20_hit_rate = top20_summary$rate,
+    hits_in_top20 = top20_summary$hits,
+    top20_evaluated_n = top20_summary$k,
+    true_positive = true_positive,
+    true_negative = true_negative,
+    false_positive = false_positive,
+    false_negative = false_negative
+  )
+}
+
+build_threshold_metrics <- function(actual, probability, thresholds) {
+  bind_rows(lapply(thresholds, function(one_threshold) {
+    calc_classification_metrics(actual, probability, threshold = one_threshold) %>%
+      mutate(threshold = one_threshold)
+  }))
+}
+# ---- Build a labeled confusion matrix for model comparison ----
+build_confusion_matrix_table <- function(actual, probability, threshold = 0.5) {
+  valid_index <- !is.na(actual) & !is.na(probability)
+  actual <- as.integer(actual[valid_index])
+  probability <- as.numeric(probability[valid_index])
+
+  if (length(actual) == 0) {
+    return(tibble())
+  }
+
+  predicted_class <- ifelse(probability >= threshold, 1L, 0L)
+  true_positive <- sum(predicted_class == 1 & actual == 1)
+  true_negative <- sum(predicted_class == 0 & actual == 0)
+  false_positive <- sum(predicted_class == 1 & actual == 0)
+  false_negative <- sum(predicted_class == 0 & actual == 1)
+
+  tibble(
+    selected_threshold = threshold,
+    actual_class = c("Actual Crash", "Actual No Crash", "Actual No Crash", "Actual Crash"),
+    predicted_class = c("Predicted Crash", "Predicted No Crash", "Predicted Crash", "Predicted No Crash"),
+    cell = c("TP", "TN", "FP", "FN"),
+    count = c(true_positive, true_negative, false_positive, false_negative)
+  ) %>%
+    mutate(
+      n_eval = sum(count),
+      share = ifelse(n_eval > 0, count / n_eval, NA_real_)
+    )
+}
+
+fit_weighted_logistic_model_target <- function(train_data, apply_data, feature_cols, target_col, binary_features = character()) {
+  prepared_frames <- build_model_frame(
+    train_data = train_data,
+    apply_data = apply_data,
+    feature_cols = feature_cols,
+    binary_features = binary_features,
+    standardize = TRUE
+  )
+
+  target_vector <- as.integer(train_data[[target_col]])
+  positive_count <- sum(target_vector == 1, na.rm = TRUE)
+  negative_count <- sum(target_vector == 0, na.rm = TRUE)
+
+  if (positive_count == 0 || negative_count == 0) {
+    return(NULL)
+  }
+
+  case_weights <- ifelse(target_vector == 1, negative_count / positive_count, 1)
+  fit_data <- bind_cols(tibble(target = target_vector), prepared_frames$train)
+
+  glm_fit <- tryCatch(
+    glm(target ~ ., data = fit_data, family = binomial(), weights = case_weights),
+    error = function(error) NULL
+  )
+
+  if (is.null(glm_fit)) {
+    return(NULL)
+  }
+
+  predicted_probability <- as.numeric(predict(glm_fit, newdata = prepared_frames$apply, type = "response"))
+  predicted_probability <- pmin(pmax(predicted_probability, 1e-6), 1 - 1e-6)
+
+  coefficient_table <- summary(glm_fit)$coefficients
+
+  list(
+    probability = predicted_probability,
+    fitted_model = glm_fit,
+    coefficient_table = tibble(
+      term = rownames(coefficient_table),
+      estimate = as.numeric(coefficient_table[, 1]),
+      std_error = as.numeric(coefficient_table[, 2]),
+      statistic = as.numeric(coefficient_table[, 3]),
+      p_value = as.numeric(coefficient_table[, 4])
+    )
+  )
+}
+
+fit_ranger_probability_model_target <- function(train_data, apply_data, feature_cols, target_col, binary_features = character()) {
+  prepared_frames <- build_model_frame(
+    train_data = train_data,
+    apply_data = apply_data,
+    feature_cols = feature_cols,
+    binary_features = binary_features,
+    standardize = FALSE
+  )
+
+  target_vector <- as.integer(train_data[[target_col]])
+  positive_count <- sum(target_vector == 1, na.rm = TRUE)
+  negative_count <- sum(target_vector == 0, na.rm = TRUE)
+
+  if (positive_count == 0 || negative_count == 0) {
+    return(NULL)
+  }
+
+  case_weights <- ifelse(target_vector == 1, negative_count / positive_count, 1)
+  fit_data <- bind_cols(
+    tibble(target = factor(target_vector, levels = c(0, 1))),
+    prepared_frames$train
+  )
+
+  ranger_fit <- tryCatch(
+    ranger::ranger(
+      target ~ .,
+      data = fit_data,
+      probability = TRUE,
+      num.trees = 800,
+      importance = "impurity",
+      case.weights = case_weights,
+      seed = 20260425,
+      mtry = max(1, floor(sqrt(length(feature_cols))))
+    ),
+    error = function(error) NULL
+  )
+
+  if (is.null(ranger_fit)) {
+    return(NULL)
+  }
+   prediction_matrix <- predict(ranger_fit, data = prepared_frames$apply)$predictions
+  probability_column <- if ("1" %in% colnames(prediction_matrix)) prediction_matrix[, "1"] else prediction_matrix[, ncol(prediction_matrix)]
+
+  list(
+    probability = as.numeric(probability_column),
+    fitted_model = ranger_fit,
+    importance_table = tibble(
+      term = names(ranger_fit$variable.importance),
+      importance = as.numeric(ranger_fit$variable.importance)
+    ) %>%
+      arrange(desc(importance))
+  )
+}
+```
+
+### Build 2024-2025 Prices and Two-Year Labels
+
+```{r ml-warning-2y-prices-labels}
+price_map_ml <- final_panel %>%
+  distinct(symbol, company_name, cik, gics_sector, gics_sub_industry)
+
+price_2024 <- ensure_warning_price_year(
+  year_value = WARNING_EXTERNAL_START_YEAR,
+  output_file = DERIVED_ML_FILES$price_2024,
+  price_map = price_map_ml,
+  force_refresh = FORCE_REFRESH_WARNING_PRICES
+)
+
+price_2025 <- ensure_warning_price_year(
+  year_value = WARNING_EXTERNAL_END_YEAR,
+  output_file = DERIVED_ML_FILES$price_2025,
+  price_map = price_map_ml,
+  force_refresh = FORCE_REFRESH_WARNING_PRICES
+)
+
+price_daily_extended <- bind_rows(
+  price_daily %>%
+    select(price_symbol, date, adj_close, volume, symbol, company_name, cik, gics_sector, gics_sub_industry),
+  price_2024,
+  price_2025
+) %>%
+  distinct(symbol, date, .keep_all = TRUE) %>%
+  arrange(symbol, date)
+
+data.table::fwrite(price_daily_extended, DERIVED_ML_FILES$price_daily_extended)
+
+if (!file.exists(DERIVED_ML_FILES$crash_metrics_extended) || FORCE_REBUILD_WARNING_LABELS) {
+  message(">>> Rebuilding crash metrics through 2025")
+  crash_metrics_extended <- build_sp500_crash_metrics(price_daily_extended)
+  data.table::fwrite(crash_metrics_extended, DERIVED_ML_FILES$crash_metrics_extended)
+} else {
+  crash_metrics_extended <- readr::read_csv(
+    DERIVED_ML_FILES$crash_metrics_extended,
+    show_col_types = FALSE
+  )
+}
+
+crash_metrics_extended <- crash_metrics_extended %>%
+  mutate(
+    year = as.integer(year),
+    NCSKEW = as.numeric(NCSKEW),
+    CRASH_DUMMY = as.integer(CRASH_DUMMY),
+    SIGMA = as.numeric(SIGMA),
+    RET_MEAN = as.numeric(RET_MEAN),
+    DTURN = as.numeric(DTURN)
+  ) %>%
+  arrange(symbol, year)
+
+two_year_label_summary <- crash_metrics_extended %>%
+  filter(year >= 2013, year <= WARNING_EXTERNAL_END_YEAR) %>%
+  group_by(year) %>%
+  summarise(
+    firms_with_label = n(),
+    crash_rate = mean(CRASH_DUMMY, na.rm = TRUE),
+    mean_ncskew = mean(NCSKEW, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+two_year_label_summary %>% knitr::kable(digits = 4)
+```
+
+### Build the Two-Year Supervised Learning Sample
+
+The two-year sample pairs feature year (t) with a two-year-ahead window
+[t+1, t+2]. A firm is labeled positive if it experiences a crash in either year.
+The label construction:
+  - `crash_t1`: crash event in t+1
+  - `crash_t2`: crash event in t+2
+  - `future_2y_crash_dummy`: crash_t1 | crash_t2 (only when both years are observed)
+
+```{r ml-warning-2y-sample}
+# ---- Reuse the same feature column groups from the one-year setup ----
+price_feature_cols <- c(
+  "annual_return",
+  "annual_log_return",
+  "annual_volatility",
+  "max_drawdown",
+  "avg_volume",
+  "median_volume",
+  "n_trading_days"
+)
+
+snapshot_numeric_cols <- c(
+  "snapshot_total_esg_risk",
+  "snapshot_environment_risk",
+  "snapshot_social_risk",
+  "snapshot_governance_risk",
+  "snapshot_controversy_score",
+  "snapshot_esg_percentile"
+)
+
+edgar_numeric_cols <- c(
+  "edgar_e_score",
+  "edgar_s_score",
+  "edgar_g_score",
+  "edgar_esg_total",
+  "edgar_word_count"
+)
+
+warning_feature_panel_2y <- panel_for_usability %>%
+  transmute(
+    symbol,
+    company_name,
+    sector_standardized,
+    feature_year = year,
+    window_start_year = year + 1L,
+    window_end_year = year + 2L,
+    eligible_by_year,
+    across(all_of(price_feature_cols)),
+    snapshot_available = as.integer(snapshot_available),
+    edgar_available = as.integer(edgar_available),
+    across(all_of(snapshot_numeric_cols)),
+    across(all_of(edgar_numeric_cols))
+  )
+
+crash_label_t1 <- crash_metrics_extended %>%
+  transmute(
+    symbol,
+    window_start_year = year,
+    crash_t1 = as.integer(CRASH_DUMMY),
+    ncskew_t1 = as.numeric(NCSKEW)
+  )
+
+crash_label_t2 <- crash_metrics_extended %>%
+  transmute(
+    symbol,
+    window_end_year = year,
+    crash_t2 = as.integer(CRASH_DUMMY),
+    ncskew_t2 = as.numeric(NCSKEW)
+  )
+
+# ---- Merge t+1 and t+2 crash labels into a single two-year outcome ----
+ml_warning_panel_2y <- warning_feature_panel_2y %>%
+  left_join(crash_label_t1, by = c("symbol", "window_start_year")) %>%
+  left_join(crash_label_t2, by = c("symbol", "window_end_year")) %>%
+  mutate(
+    across(all_of(snapshot_numeric_cols), ~ suppressWarnings(readr::parse_number(as.character(.x)))),
+    across(all_of(edgar_numeric_cols), ~ suppressWarnings(readr::parse_number(as.character(.x)))),
+    across(all_of(price_feature_cols), ~ suppressWarnings(readr::parse_number(as.character(.x)))),
+    ncskew_t1 = suppressWarnings(readr::parse_number(as.character(ncskew_t1))),
+    ncskew_t2 = suppressWarnings(readr::parse_number(as.character(ncskew_t2))),
+    crash_t1 = as.integer(crash_t1),
+    crash_t2 = as.integer(crash_t2)
+  )
+
+for (feature_name in snapshot_numeric_cols) {
+  ml_warning_panel_2y[[paste0(feature_name, "_is_missing")]] <- as.integer(is.na(ml_warning_panel_2y[[feature_name]]))
+}
+
+for (feature_name in edgar_numeric_cols) {
+  ml_warning_panel_2y[[paste0(feature_name, "_is_missing")]] <- as.integer(is.na(ml_warning_panel_2y[[feature_name]]))
+}
+
+ml_warning_panel_2y <- ml_warning_panel_2y %>%
+  mutate(
+    window_complete = !is.na(crash_t1) & !is.na(crash_t2),
+    future_2y_crash_dummy = if_else(
+      window_complete,
+      as.integer(crash_t1 == 1L | crash_t2 == 1L),
+      NA_integer_
+    ),
+    data_split = case_when(
+      feature_year >= START_YEAR & feature_year <= (END_YEAR - 1L) ~ "pre_external_training_pool",
+      feature_year == END_YEAR ~ "external_2024_2025_test",
+      TRUE ~ "unused"
+    )
+  ) %>%
+  filter(feature_year >= START_YEAR, window_end_year <= WARNING_EXTERNAL_END_YEAR)
+
+training_pool <- ml_warning_panel_2y %>%
+  filter(
+    eligible_by_year,
+    window_complete,
+    data_split == "pre_external_training_pool"
+  )
+
+external_test_pool <- ml_warning_panel_2y %>%
+  filter(
+    eligible_by_year,
+    window_complete,
+    feature_year == END_YEAR,
+    data_split == "external_2024_2025_test"
+  )
+
+data.table::fwrite(ml_warning_panel_2y, DERIVED_ML_FILES$ml_panel)
+data.table::fwrite(training_pool, OUTPUT_ML_FILES$training_panel)
+
+tibble(
+  sample_name = c("training_pool_2y", "external_test_pool_2y"),
+  rows = c(nrow(training_pool), nrow(external_test_pool)),
+  companies = c(dplyr::n_distinct(training_pool$symbol), dplyr::n_distinct(external_test_pool$symbol)),
+  positive_rate = c(mean(training_pool$future_2y_crash_dummy, na.rm = TRUE), mean(external_test_pool$future_2y_crash_dummy, na.rm = TRUE)),
+  feature_year_span = c(
+    paste(range(training_pool$feature_year, na.rm = TRUE), collapse = "-"),
+    paste(range(external_test_pool$feature_year, na.rm = TRUE), collapse = "-")
+  ),
+  window_span = c(
+    paste0(min(training_pool$window_start_year, na.rm = TRUE), "-", max(training_pool$window_end_year, na.rm = TRUE)),
+    paste0(min(external_test_pool$window_start_year, na.rm = TRUE), "-", max(external_test_pool$window_end_year, na.rm = TRUE))
+  )
+) %>%
+  knitr::kable(digits = 4)
+```
+
+
+### Two-Year Model Training and Threshold Selection
+
+Training uses **feature-year CV** (2018-2022): models train on earlier feature years
+and validate on each holdout feature year. This differs from the one-year setup
+(target-year CV) because each feature year's validation window spans two future years,
+making target-year splits less clean.
+
+The same 6 model specifications (3 feature sets × 2 algorithms) are reused so
+one-year and two-year results are directly comparable.
+
+```{r ml-warning-2y-training}
+snapshot_missing_flags <- paste0(snapshot_numeric_cols, "_is_missing")
+edgar_missing_flags <- paste0(edgar_numeric_cols, "_is_missing")
+
+# ---- Mirror the one-year specifications (same feature sets, same algorithms) ----
+model_specifications <- tibble(
+  feature_set_id = c("price_baseline", "price_plus_snapshot_esg", "price_plus_full_esg"),
+  feature_set_label = c("Price Baseline", "Price + Snapshot ESG", "Price + Full ESG"),
+  feature_columns = list(
+    price_feature_cols,
+    c(price_feature_cols, "snapshot_available", snapshot_numeric_cols, snapshot_missing_flags),
+    c(price_feature_cols, "snapshot_available", snapshot_numeric_cols, snapshot_missing_flags, "edgar_available", edgar_numeric_cols, edgar_missing_flags)
+  ),
+  binary_columns = list(
+    character(),
+    c("snapshot_available", snapshot_missing_flags),
+    c("snapshot_available", snapshot_missing_flags, "edgar_available", edgar_missing_flags)
+  )
+) %>%
+  tidyr::crossing(
+    tibble(
+      model_type = c("weighted_logistic", "ranger_probability_forest"),
+      model_label = c("Weighted Logistic", "Probability Random Forest")
+    )
+  ) %>%
+  mutate(
+    model_key = paste(feature_set_id, model_type, sep = "__"),
+    model_display = paste(feature_set_label, model_label, sep = " | ")
+  )
+
+# ---- Feature-year CV: validate on 2018-2022 features, reserve 2023 for external test ----
+validation_feature_years <- 2018:2022
+threshold_grid <- seq(0.05, 0.95, by = 0.01)
+
+validation_fold_results <- list()
+validation_threshold_results <- list()
+
+for (spec_index in seq_len(nrow(model_specifications))) {
+  one_spec <- model_specifications[spec_index, ]
+  feature_columns <- one_spec$feature_columns[[1]]
+  binary_columns <- one_spec$binary_columns[[1]]
+
+  for (one_validation_feature_year in validation_feature_years) {
+    train_fold <- training_pool %>%
+      filter(feature_year < one_validation_feature_year)
+
+    valid_fold <- training_pool %>%
+      filter(feature_year == one_validation_feature_year)
+
+    if (nrow(train_fold) == 0 || nrow(valid_fold) == 0) {
+      next
+    }
+
+    fitted_output <- if (one_spec$model_type[[1]] == "weighted_logistic") {
+      fit_weighted_logistic_model_target(
+        train_data = train_fold,
+        apply_data = valid_fold,
+        feature_cols = feature_columns,
+        target_col = "future_2y_crash_dummy",
+        binary_features = binary_columns
+      )
+    } else {
+      fit_ranger_probability_model_target(
+        train_data = train_fold,
+        apply_data = valid_fold,
+        feature_cols = feature_columns,
+        target_col = "future_2y_crash_dummy",
+        binary_features = binary_columns
+      )
+    }
+
+    if (is.null(fitted_output)) {
+      next
+    }
+
+    fold_prediction <- valid_fold %>%
+      transmute(
+        model_key = one_spec$model_key[[1]],
+        model_display = one_spec$model_display[[1]],
+        feature_set_id = one_spec$feature_set_id[[1]],
+        feature_set_label = one_spec$feature_set_label[[1]],
+        model_type = one_spec$model_type[[1]],
+        model_label = one_spec$model_label[[1]],
+        validation_feature_year = one_validation_feature_year,
+        validation_window = paste0(window_start_year, "-", window_end_year),
+        symbol,
+        company_name,
+        actual_label = future_2y_crash_dummy,
+        crash_t1,
+        crash_t2,
+        risk_probability = fitted_output$probability
+      ) %>%
+      mutate(
+        risk_rank = min_rank(desc(risk_probability))
+      )
+
+    fold_metrics <- calc_classification_metrics(
+      actual = fold_prediction$actual_label,
+      probability = fold_prediction$risk_probability,
+      threshold = 0.50
+    ) %>%
+      mutate(
+        model_key = one_spec$model_key[[1]],
+        model_display = one_spec$model_display[[1]],
+        feature_set_id = one_spec$feature_set_id[[1]],
+        feature_set_label = one_spec$feature_set_label[[1]],
+        model_type = one_spec$model_type[[1]],
+        model_label = one_spec$model_label[[1]],
+        validation_feature_year = one_validation_feature_year,
+        validation_window = paste0(min(valid_fold$window_start_year), "-", max(valid_fold$window_end_year)),
+        train_rows = nrow(train_fold),
+        validation_rows = nrow(valid_fold),
+        train_positive_rate = mean(train_fold$future_2y_crash_dummy, na.rm = TRUE),
+        validation_positive_rate = mean(valid_fold$future_2y_crash_dummy, na.rm = TRUE)
+      )
+
+    threshold_metrics <- build_threshold_metrics(
+      actual = fold_prediction$actual_label,
+      probability = fold_prediction$risk_probability,
+      thresholds = threshold_grid
+    ) %>%
+      mutate(
+        model_key = one_spec$model_key[[1]],
+        model_display = one_spec$model_display[[1]],
+        feature_set_id = one_spec$feature_set_id[[1]],
+        feature_set_label = one_spec$feature_set_label[[1]],
+        model_type = one_spec$model_type[[1]],
+        model_label = one_spec$model_label[[1]],
+        validation_feature_year = one_validation_feature_year
+      )
+
+    validation_fold_results[[length(validation_fold_results) + 1]] <- fold_metrics
+    validation_threshold_results[[length(validation_threshold_results) + 1]] <- threshold_metrics
+  }
+}
+
+validation_fold_metrics <- bind_rows(validation_fold_results)
+validation_threshold_metrics <- bind_rows(validation_threshold_results)
+
+threshold_selection <- validation_threshold_metrics %>%
+  group_by(model_key, model_display, feature_set_id, feature_set_label, model_type, model_label, threshold) %>%
+  summarise(
+    mean_accuracy = mean(accuracy, na.rm = TRUE),
+    mean_balanced_accuracy = mean(balanced_accuracy, na.rm = TRUE),
+    mean_precision = mean(precision, na.rm = TRUE),
+    mean_recall = mean(recall, na.rm = TRUE),
+    mean_f0_5 = mean(f0_5, na.rm = TRUE),
+    mean_pr_auc_proxy = mean(pr_auc, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(model_key, model_display, feature_set_id, feature_set_label, model_type, model_label) %>%
+  group_modify(~ choose_threshold_from_validation(.x)) %>%
+  ungroup() %>%
+  rename(selected_threshold = threshold)
+
+cv_model_comparison <- validation_fold_metrics %>%
+  group_by(model_key, model_display, feature_set_id, feature_set_label, model_type, model_label) %>%
+  summarise(
+    fold_count = n(),
+    mean_accuracy = mean(accuracy, na.rm = TRUE),
+    mean_balanced_accuracy = mean(balanced_accuracy, na.rm = TRUE),
+    mean_precision = mean(precision, na.rm = TRUE),
+    mean_recall = mean(recall, na.rm = TRUE),
+    mean_f0_5 = mean(f0_5, na.rm = TRUE),
+    mean_roc_auc = mean(roc_auc, na.rm = TRUE),
+    mean_pr_auc = mean(pr_auc, na.rm = TRUE),
+    mean_precision_at_top10 = mean(precision_at_top10, na.rm = TRUE),
+    mean_top20_hit_rate = mean(top20_hit_rate, na.rm = TRUE),
+    mean_train_positive_rate = mean(train_positive_rate, na.rm = TRUE),
+    mean_validation_positive_rate = mean(validation_positive_rate, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    threshold_selection %>%
+      select(model_key, selected_threshold, mean_accuracy, mean_balanced_accuracy, mean_precision, mean_recall, mean_f0_5),
+    by = "model_key",
+    suffix = c("_cv", "_threshold")
+  ) %>%
+  arrange(desc(mean_pr_auc), desc(mean_precision_at_top10), desc(mean_f0_5_cv), desc(mean_accuracy_cv), model_type)
+
+best_overall_model <- cv_model_comparison %>%
+  arrange(desc(mean_pr_auc), desc(mean_precision_at_top10), desc(mean_f0_5_cv), desc(mean_accuracy_cv), model_type) %>%
+  slice(1)
+
+best_logistic_model <- cv_model_comparison %>%
+  filter(model_type == "weighted_logistic") %>%
+  arrange(desc(mean_pr_auc), desc(mean_precision_at_top10), desc(mean_f0_5_cv), desc(mean_accuracy_cv)) %>%
+  slice(1)
+
+best_forest_model <- cv_model_comparison %>%
+  filter(model_type == "ranger_probability_forest") %>%
+  arrange(desc(mean_pr_auc), desc(mean_precision_at_top10), desc(mean_f0_5_cv), desc(mean_accuracy_cv)) %>%
+  slice(1)
+
+data.table::fwrite(validation_fold_metrics, OUTPUT_ML_FILES$validation_fold_metrics)
+data.table::fwrite(validation_threshold_metrics, OUTPUT_ML_FILES$threshold_tuning)
+data.table::fwrite(cv_model_comparison, OUTPUT_ML_FILES$cv_model_comparison)
+
+cv_model_comparison %>%
+  select(model_display, mean_pr_auc, mean_precision_at_top10, mean_f0_5_cv, mean_accuracy_cv, selected_threshold) %>%
+  knitr::kable(digits = 4)
+```
+
+### 2024-2025 Two-Year External Validation and Warning Outputs
+
+The two-year external test uses 2023 features to predict crashes in the 2024-2025
+window. Since 2025 crash labels are now realized, this provides an additional
+out-of-sample check beyond the one-year 2024-only test.
+
+Additional outputs vs. one-year:
+- Confusion matrices (all models + champion only)
+- Accuracy/precision/recall/F0.5 comparison bar chart
+- Two-year champion model's top-20 high-risk company list
+
+```{r ml-warning-2y-external-validation}
+external_prediction_results <- list()
+logistic_coefficient_tables <- list()
+forest_importance_tables <- list()
+pr_curve_tables <- list()
+
+for (spec_index in seq_len(nrow(model_specifications))) {
+  one_spec <- model_specifications[spec_index, ]
+  feature_columns <- one_spec$feature_columns[[1]]
+  binary_columns <- one_spec$binary_columns[[1]]
+
+  fitted_output <- if (one_spec$model_type[[1]] == "weighted_logistic") {
+    fit_weighted_logistic_model_target(
+      train_data = training_pool,
+      apply_data = external_test_pool,
+      feature_cols = feature_columns,
+      target_col = "future_2y_crash_dummy",
+      binary_features = binary_columns
+    )
+  } else {
+    fit_ranger_probability_model_target(
+      train_data = training_pool,
+      apply_data = external_test_pool,
+      feature_cols = feature_columns,
+      target_col = "future_2y_crash_dummy",
+      binary_features = binary_columns
+    )
+  }
+
+  if (is.null(fitted_output)) {
+    next
+  }
+
+  final_threshold <- threshold_selection %>%
+    filter(model_key == one_spec$model_key[[1]]) %>%
+    pull(selected_threshold)
+
+  if (length(final_threshold) == 0 || is.na(final_threshold[[1]])) {
+    final_threshold <- 0.5
+  } else {
+    final_threshold <- final_threshold[[1]]
+  }
+
+  final_prediction <- external_test_pool %>%
+    transmute(
+      model_key = one_spec$model_key[[1]],
+      model_display = one_spec$model_display[[1]],
+      feature_set_id = one_spec$feature_set_id[[1]],
+      feature_set_label = one_spec$feature_set_label[[1]],
+      model_type = one_spec$model_type[[1]],
+      model_label = one_spec$model_label[[1]],
+      symbol,
+      company_name,
+      sector_standardized,
+      feature_year,
+      window_start_year,
+      window_end_year,
+      crash_t1,
+      crash_t2,
+      ncskew_t1,
+      ncskew_t2,
+      future_2y_crash_dummy,
+      risk_probability = fitted_output$probability
+    ) %>%
+    mutate(
+      selected_threshold = final_threshold,
+      warning_flag = risk_probability >= selected_threshold,
+      risk_rank = min_rank(desc(risk_probability))
+    )
+
+  external_prediction_results[[length(external_prediction_results) + 1]] <- final_prediction
+
+  if (!is.null(fitted_output$coefficient_table)) {
+    logistic_coefficient_tables[[one_spec$model_key[[1]]]] <- fitted_output$coefficient_table %>%
+      mutate(
+        model_key = one_spec$model_key[[1]],
+        model_display = one_spec$model_display[[1]]
+      )
+  }
+
+  if (!is.null(fitted_output$importance_table)) {
+    forest_importance_tables[[one_spec$model_key[[1]]]] <- fitted_output$importance_table %>%
+      mutate(
+        model_key = one_spec$model_key[[1]],
+        model_display = one_spec$model_display[[1]]
+      )
+  }
+
+  pr_curve_tables[[one_spec$model_key[[1]]]] <- build_pr_curve_data(
+    actual = final_prediction$future_2y_crash_dummy,
+    probability = final_prediction$risk_probability,
+    model_label = one_spec$model_display[[1]]
+  )
+}
+
+external_predictions <- bind_rows(external_prediction_results)
+logistic_coefficients_all <- bind_rows(logistic_coefficient_tables)
+forest_importance_all <- bind_rows(forest_importance_tables)
+pr_curve_2y <- bind_rows(pr_curve_tables)
+
+external_test_metrics <- external_predictions %>%
+  group_by(model_key, model_display, feature_set_id, feature_set_label, model_type, model_label) %>%
+  group_modify(~ {
+    threshold_value <- unique(.x$selected_threshold)[1]
+    calc_classification_metrics(.x$future_2y_crash_dummy, .x$risk_probability, threshold = threshold_value)
+  }) %>%
+  ungroup() %>%
+  arrange(desc(pr_auc), desc(precision_at_top10), desc(f0_5), desc(accuracy))
+
+confusion_matrix_by_model <- external_predictions %>%
+  group_by(model_key, model_display, feature_set_id, feature_set_label, model_type, model_label) %>%
+  group_modify(~ {
+    threshold_value <- unique(.x$selected_threshold)[1]
+    build_confusion_matrix_table(.x$future_2y_crash_dummy, .x$risk_probability, threshold = threshold_value)
+  }) %>%
+  ungroup()
+
+champion_model_key <- best_overall_model$model_key[[1]]
+champion_predictions <- external_predictions %>%
+  filter(model_key == champion_model_key) %>%
+  arrange(risk_rank)
+
+champion_model_label <- if (nrow(champion_predictions) > 0) champion_predictions$model_display[[1]] else "No model available"
+
+top_risk_companies_2y <- champion_predictions %>%
+  slice_head(n = 20) %>%
+  select(
+    model_display,
+    symbol,
+    company_name,
+    sector_standardized,
+    feature_year,
+    window_start_year,
+    window_end_year,
+    risk_probability,
+    selected_threshold,
+    warning_flag,
+    crash_t1,
+    crash_t2,
+    future_2y_crash_dummy,
+    risk_rank
+  )
+
+baseline_external <- external_test_metrics %>%
+  filter(feature_set_id == "price_baseline") %>%
+  arrange(desc(pr_auc), desc(precision_at_top10), desc(f0_5), desc(accuracy)) %>%
+  slice(1)
+
+best_esg_external <- external_test_metrics %>%
+  filter(feature_set_id != "price_baseline") %>%
+  arrange(desc(pr_auc), desc(precision_at_top10), desc(f0_5), desc(accuracy)) %>%
+  slice(1)
+
+esg_gain_summary <- tibble(
+  baseline_model = baseline_external$model_display,
+  baseline_pr_auc = baseline_external$pr_auc,
+  baseline_precision_at_top10 = baseline_external$precision_at_top10,
+  best_esg_model = best_esg_external$model_display,
+  best_esg_pr_auc = best_esg_external$pr_auc,
+  best_esg_precision_at_top10 = best_esg_external$precision_at_top10,
+  esg_adds_value = ifelse(
+    best_esg_external$pr_auc > baseline_external$pr_auc |
+      best_esg_external$precision_at_top10 > baseline_external$precision_at_top10,
+    "YES",
+    "NO"
+  )
+)
+
+data.table::fwrite(external_test_metrics, OUTPUT_ML_FILES$test_metrics)
+data.table::fwrite(confusion_matrix_by_model, OUTPUT_ML_FILES$confusion_matrix)
+data.table::fwrite(external_predictions, OUTPUT_ML_FILES$company_predictions)
+data.table::fwrite(top_risk_companies_2y, OUTPUT_ML_FILES$top_risk_companies)
+
+pr_curve_plot <- pr_curve_2y %>%
+  ggplot(aes(x = recall, y = precision, color = model_label)) +
+  geom_line(linewidth = 1) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title = "2024-2025 External Test PR Curve",
+    x = "Recall",
+    y = "Precision",
+    color = "Model"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+accuracy_precision_plot_data <- external_test_metrics %>%
+  select(model_display, accuracy, balanced_accuracy, precision, recall, f0_5) %>%
+  pivot_longer(
+    cols = -model_display,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(
+      metric,
+      levels = c("accuracy", "balanced_accuracy", "precision", "recall", "f0_5"),
+      labels = c("Accuracy", "Balanced Accuracy", "Precision", "Recall", "F0.5")
+    ),
+    model_display = factor(model_display, levels = rev(unique(external_test_metrics$model_display)))
+  )
+
+accuracy_precision_plot <- accuracy_precision_plot_data %>%
+  ggplot(aes(x = model_display, y = value, fill = metric)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.72) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "2024-2025 External Test Accuracy and Precision Profile",
+    x = "Model",
+    y = "Metric Value",
+    fill = "Metric"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+confusion_matrix_plot_data <- confusion_matrix_by_model %>%
+  mutate(
+    actual_class = factor(actual_class, levels = c("Actual Crash", "Actual No Crash")),
+    predicted_class = factor(predicted_class, levels = c("Predicted Crash", "Predicted No Crash")),
+    cell_label = paste0("n = ", count, "\n", scales::percent(share, accuracy = 0.1))
+  )
+
+confusion_matrix_all_plot <- confusion_matrix_plot_data %>%
+  ggplot(aes(x = predicted_class, y = actual_class, fill = share)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(aes(label = cell_label), size = 3.2, lineheight = 0.95) +
+  facet_wrap(~ model_display) +
+  scale_fill_gradient(low = "#F3F4F6", high = "#2F6DB3", labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "2024-2025 Confusion Matrix by Model",
+    x = "Predicted Class",
+    y = "Actual Class",
+    fill = "Share"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid = element_blank()
+  )
+
+champion_confusion_plot <- confusion_matrix_plot_data %>%
+  filter(model_key == champion_model_key) %>%
+  ggplot(aes(x = predicted_class, y = actual_class, fill = share)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(aes(label = cell_label), size = 5, lineheight = 0.95) +
+  scale_fill_gradient(low = "#F3F4F6", high = "#2F6DB3", labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Champion Model Confusion Matrix (2024-2025)",
+    subtitle = champion_model_label,
+    x = "Predicted Class",
+    y = "Actual Class",
+    fill = "Share"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    panel.grid = element_blank()
+  )
+
+top_risk_plot <- top_risk_companies_2y %>%
+  mutate(company_name = reorder(company_name, risk_probability)) %>%
+  ggplot(aes(x = company_name, y = risk_probability, fill = factor(future_2y_crash_dummy, levels = c(0, 1)))) +
+  geom_col(width = 0.75) +
+  coord_flip() +
+  scale_fill_manual(values = c("0" = "#BDBDBD", "1" = "#D95F02"), labels = c("0" = "No Crash in 2024-2025", "1" = "Crash in 2024-2025")) +
+  labs(
+    title = "Top 20 High-Risk Companies for 2024-2025",
+    subtitle = paste0("Champion model: ", champion_model_label),
+    x = "Company",
+    y = "Risk Probability",
+    fill = "Observed Outcome"
+  ) +
+  theme_minimal(base_size = 12)
+
+best_logistic_key <- if (nrow(best_logistic_model) > 0) best_logistic_model$model_key[[1]] else NA_character_
+best_logistic_label <- if (nrow(best_logistic_model) > 0) best_logistic_model$model_display[[1]] else "No logistic model available"
+
+best_logistic_coefficients <- logistic_coefficients_all %>%
+  filter(model_key == best_logistic_key, term != "(Intercept)") %>%
+  mutate(abs_estimate = abs(estimate)) %>%
+  slice_max(abs_estimate, n = 15, with_ties = FALSE) %>%
+  arrange(estimate) %>%
+  mutate(term = factor(term, levels = term))
+
+logistic_coef_plot <- if (nrow(best_logistic_coefficients) > 0) {
+  best_logistic_coefficients %>%
+    ggplot(aes(x = term, y = estimate, fill = estimate > 0)) +
+    geom_col(show.legend = FALSE) +
+    coord_flip() +
+    scale_fill_manual(values = c("TRUE" = "#2F6DB3", "FALSE" = "#D95F02")) +
+    labs(
+      title = "Best Logistic Model Coefficients (2-Year Warning)",
+      subtitle = best_logistic_label,
+      x = "Feature",
+      y = "Coefficient Estimate"
+    ) +
+    theme_minimal(base_size = 12)
+} else {
+  ggplot() +
+    annotate("text", x = 1, y = 1, label = "No logistic coefficients available") +
+    labs(title = "Best Logistic Model Coefficients (2-Year Warning)") +
+    theme_void()
+}
+
+best_forest_key <- if (nrow(best_forest_model) > 0) best_forest_model$model_key[[1]] else NA_character_
+best_forest_label <- if (nrow(best_forest_model) > 0) best_forest_model$model_display[[1]] else "No forest model available"
+
+best_forest_importance <- forest_importance_all %>%
+  filter(model_key == best_forest_key) %>%
+  slice_max(importance, n = 15, with_ties = FALSE) %>%
+  arrange(importance) %>%
+  mutate(term = factor(term, levels = term))
+
+forest_importance_plot <- if (nrow(best_forest_importance) > 0) {
+  best_forest_importance %>%
+    ggplot(aes(x = term, y = importance)) +
+    geom_col(fill = "#2F6DB3", width = 0.75) +
+    coord_flip() +
+    labs(
+      title = "Best Probability Forest Feature Importance (2-Year Warning)",
+      subtitle = best_forest_label,
+      x = "Feature",
+      y = "Importance"
+    ) +
+    theme_minimal(base_size = 12)
+} else {
+  ggplot() +
+    annotate("text", x = 1, y = 1, label = "No forest importance available") +
+    labs(title = "Best Probability Forest Feature Importance (2-Year Warning)") +
+    theme_void()
+}
+
+ggplot2::ggsave(OUTPUT_ML_FILES$pr_curve, pr_curve_plot, width = 9.5, height = 6.2, dpi = 160)
+ggplot2::ggsave(OUTPUT_ML_FILES$accuracy_precision_plot, accuracy_precision_plot, width = 10.5, height = 6.8, dpi = 160)
+ggplot2::ggsave(OUTPUT_ML_FILES$confusion_all_plot, confusion_matrix_all_plot, width = 12, height = 8, dpi = 160)
+ggplot2::ggsave(OUTPUT_ML_FILES$confusion_champion_plot, champion_confusion_plot, width = 7.5, height = 6.5, dpi = 160)
+ggplot2::ggsave(OUTPUT_ML_FILES$top_risk_plot, top_risk_plot, width = 10, height = 7, dpi = 160)
+ggplot2::ggsave(OUTPUT_ML_FILES$logistic_coef_plot, logistic_coef_plot, width = 10, height = 7, dpi = 160)
+ggplot2::ggsave(OUTPUT_ML_FILES$forest_importance_plot, forest_importance_plot, width = 10, height = 7, dpi = 160)
+
+external_test_metrics %>%
+  select(model_display, pr_auc, roc_auc, accuracy, balanced_accuracy, precision, recall, f0_5, precision_at_top10, top20_hit_rate, selected_threshold) %>%
+  knitr::kable(digits = 4)
+
+esg_gain_summary %>% knitr::kable(digits = 4)
+```
+
+### Two-Year Machine Learning Validation Checks
+
+Assert invariants for the two-year setup:
+- Window boundaries align correctly with feature years
+- Training pool excludes realized 2025 labels
+- 2-year label exactly equals crash_t1 | crash_t2
+- Confusion matrix cell counts sum to evaluation sample size
+
+```{r ml-warning-2y-validation}
+# ---- Verify two-year temporal alignment ----
+stopifnot(all(training_pool$window_start_year == training_pool$feature_year + 1L))
+stopifnot(all(training_pool$window_end_year == training_pool$feature_year + WARNING_LOOKAHEAD_YEARS))
+stopifnot(!any(training_pool$window_end_year == WARNING_EXTERNAL_END_YEAR))
+stopifnot(all(external_test_pool$feature_year == END_YEAR))
+stopifnot(all(external_test_pool$window_start_year == WARNING_EXTERNAL_START_YEAR))
+stopifnot(all(external_test_pool$window_end_year == WARNING_EXTERNAL_END_YEAR))
+stopifnot(!any(is.na(training_pool$future_2y_crash_dummy)))
+stopifnot(all(
+  ml_warning_panel_2y$future_2y_crash_dummy[ml_warning_panel_2y$window_complete] ==
+    as.integer(
+      ml_warning_panel_2y$crash_t1[ml_warning_panel_2y$window_complete] == 1L |
+        ml_warning_panel_2y$crash_t2[ml_warning_panel_2y$window_complete] == 1L
+    )
+))
+stopifnot(nrow(external_test_metrics) == nrow(model_specifications))
+stopifnot(all(external_test_metrics$selected_threshold >= 0.05 & external_test_metrics$selected_threshold <= 0.95))
+stopifnot(all(external_test_metrics$accuracy >= 0 & external_test_metrics$accuracy <= 1))
+stopifnot(all(external_test_metrics$balanced_accuracy[!is.na(external_test_metrics$balanced_accuracy)] >= 0 & external_test_metrics$balanced_accuracy[!is.na(external_test_metrics$balanced_accuracy)] <= 1))
+stopifnot(all(external_test_metrics$pr_auc[!is.na(external_test_metrics$pr_auc)] >= 0 & external_test_metrics$pr_auc[!is.na(external_test_metrics$pr_auc)] <= 1))
+stopifnot(all(external_test_metrics$roc_auc[!is.na(external_test_metrics$roc_auc)] >= 0 & external_test_metrics$roc_auc[!is.na(external_test_metrics$roc_auc)] <= 1))
+stopifnot(all(external_predictions$risk_rank >= 1))
+
+confusion_validation <- confusion_matrix_by_model %>%
+  group_by(model_key) %>%
+  summarise(total_count = sum(count), .groups = "drop") %>%
+  inner_join(external_test_metrics %>% select(model_key, n_eval), by = "model_key")
+
+stopifnot(all(confusion_validation$total_count == confusion_validation$n_eval))
+
+ml_validation_summary_2y <- tibble(
+  check = c(
+    "window_start_year always equals feature_year + 1",
+    "window_end_year always equals feature_year + 2",
+    "Training pool excludes realized 2025 labels",
+    "External test uses 2023 features and validates 2024-2025",
+    "The 2-year label equals a crash in either of the next two years",
+    "Accuracy / Balanced Accuracy / PR AUC / ROC AUC lie within [0, 1]",
+    "Confusion matrix cells sum to the external test sample size"
+  ),
+  result = "PASS"
+)
+
+knitr::kable(ml_validation_summary_2y)
+```
+
+### Two-Year Machine Learning Output Files
+
+```{r ml-warning-2y-output-files}
+ml_output_table_2y <- tibble(
+  file = to_project_relative(c(unname(unlist(DERIVED_ML_FILES)), unname(unlist(OUTPUT_ML_FILES)))),
+  description = c(
+    "Cached 2024 daily price data used for the 2-year warning task",
+    "Newly fetched 2025 daily price data",
+    "Extended 2011-2025 daily price table",
+    "Extended 2012-2025 annual crash label table",
+    "ML base panel linking 2012-2023 features to 2-year forward labels",
+    "2-year training sample export",
+    "2-year validation fold metrics by feature year",
+    "2-year threshold search results across validation folds",
+    "2-year cross-validation model comparison",
+    "2024-2025 external test metrics table",
+    "2024-2025 confusion matrix table by model",
+    "2024-2025 company-level prediction table",
+    "2024-2025 high-risk company list",
+    "2024-2025 external test PR curve",
+    "2024-2025 accuracy and precision comparison chart",
+    "2024-2025 confusion matrix chart for all models",
+    "2024-2025 confusion matrix chart for the champion model",
+    "2024-2025 Top high-risk companies chart",
+    "Best logistic coefficient chart for the 2-year task",
+    "Best forest feature importance chart for the 2-year task"
+  )
+)
+
+knitr::kable(ml_output_table_2y)
+```
+
