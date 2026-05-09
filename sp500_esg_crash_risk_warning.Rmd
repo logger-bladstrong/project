@@ -3263,6 +3263,32 @@ knitr::kable(ml_validation_summary_2y)
 
 ### Two-Year Machine Learning Output Files
 
+```{r ml-warning-2y-output-files}
+ml_output_table_2y <- tibble(
+  file = to_project_relative(c(unname(unlist(DERIVED_ML_FILES)), unname(unlist(OUTPUT_ML_FILES)))),
+  description = c(
+    "Cached 2024 daily price data used for the 2-year warning task",
+    "Newly fetched 2025 daily price data",
+    "Extended 2011-2025 daily price table",
+    "Extended 2012-2025 annual crash label table",
+    "ML base panel linking 2012-2023 features to 2-year forward labels",
+    "2-year training sample export",
+    "2-year validation fold metrics by feature year",
+    "2-year threshold search results across validation folds",
+    "2-year cross-validation model comparison",
+    "2024-2025 external test metrics table",
+    "2024-2025 confusion matrix table by model",
+    "2024-2025 company-level prediction table",
+    "2024-2025 high-risk company list",
+    "2024-2025 external test PR curve",
+    "2024-2025 accuracy and precision comparison chart",
+    "2024-2025 confusion matrix chart for all models",
+    "2024-2025 confusion matrix chart for the champion model",
+    "2024-2025 Top high-risk companies chart",
+    "Best logistic coefficient chart for the 2-year task",
+    "Best forest feature importance chart for the 2-year task"
+  )
+)
 
 
 knitr::kable(ml_output_table_2y)
