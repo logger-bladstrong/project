@@ -18,7 +18,7 @@ params:
 
 ## Goal
 
-
+This notebook implements a complete S&P 500 ESG research pipeline with three integrated layers:
 
 1. **Data Foundation**: Build a multi-year firm-year panel by merging the current S&P 500 constituent universe, daily price history (Yahoo Finance), a cross-sectional ESG snapshot, and annual EDGAR 10-K text-based ESG signals.
 2. **Data Usability Audit**: Measure coverage, missingness, and sample usability under dual-denominator definitions (full 503-firm sample vs. effective post-index-entry sample), broken down by year and sector.
