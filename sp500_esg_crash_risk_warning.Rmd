@@ -1463,3 +1463,184 @@ coverage_by_year_dual %>%
   head(12) %>%
   knitr::kable()
 ```
+
+### Visualization Outputs
+
+```{r usability-plots, fig.width=10, fig.height=6}
+yearly_coverage_plot <- coverage_by_year_dual %>%
+  ggplot(aes(x = year, y = coverage_rate, color = metric_label, group = metric_label)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.8) +
+  facet_wrap(~ denominator_label, ncol = 1) +
+  scale_color_manual(values = metric_colors) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "S&P 500 Coverage Rates (Dual Denominator)",
+    subtitle = "Showing both the full sample of 503 firms and the effective post-entry sample",
+    x = "Year",
+    y = "Coverage Rate",
+    color = "Data Type"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+joint_coverage_bar_plot <- coverage_by_year_dual %>%
+  filter(
+    denominator_type == "effective_sample",
+    metric %in% c("price_and_snapshot", "price_and_edgar")
+  ) %>%
+  ggplot(aes(x = factor(year), y = coverage_rate, fill = metric_label)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_fill_manual(values = metric_colors[c("Price + Snapshot ESG", "Price + EDGAR ESG")]) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Coverage of Jointly Available Samples",
+    subtitle = "Effective post-entry sample definition",
+    x = "Year",
+    y = "Coverage Rate",
+    fill = "Joint Sample Type"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+sector_heatmap_data <- coverage_by_sector_dual %>%
+  filter(
+    denominator_type == "effective_sample",
+    coverage_period == "all_years_avg"
+  ) %>%
+  group_by(sector_standardized) %>%
+  mutate(
+    edgar_sort = coverage_rate[metric == "edgar_available"][1]
+  ) %>%
+  ungroup() %>%
+  mutate(
+    sector_standardized = reorder(sector_standardized, edgar_sort, na.rm = TRUE),
+    metric_label = factor(metric_label, levels = unname(metric_labels), ordered = TRUE)
+  )
+
+sector_heatmap_plot <- sector_heatmap_data %>%
+  ggplot(aes(x = metric_label, y = sector_standardized, fill = coverage_rate)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = ifelse(is.na(coverage_rate), "NA", scales::percent(coverage_rate, accuracy = 1))), size = 3) +
+  scale_fill_gradient(low = "#F1F5F9", high = "#2F6DB3", labels = scales::percent_format(accuracy = 1), na.value = "#D9D9D9") +
+  labs(
+    title = "Sector-Level Coverage Heatmap",
+    subtitle = "Effective post-entry sample definition using average coverage across the full period",
+    x = "Data Type",
+    y = "Standardized Sector",
+    fill = "Coverage Rate"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+field_missingness_plot <- field_missingness %>%
+  mutate(field = reorder(field, missing_rate)) %>%
+  ggplot(aes(x = field, y = missing_rate, fill = field_group)) +
+  geom_col(width = 0.75) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Main Panel Field Missingness",
+    subtitle = "Missingness rates grouped by field family",
+    x = "Field",
+    y = "Missing Rate",
+    fill = "Field Group"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_text(size = 9)) +
+  coord_flip()
+
+bucket_plot <- company_coverage_buckets %>%
+  mutate(company_bucket = factor(company_bucket, levels = bucket_levels, ordered = TRUE)) %>%
+  ggplot(aes(x = company_bucket, y = company_count, fill = company_bucket)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = scales::percent(share, accuracy = 0.1)), vjust = -0.4, size = 3.5) +
+  labs(
+    title = "Firm Coverage Bucket Distribution",
+    subtitle = "Main usability combinations aggregated at the firm level",
+    x = "Coverage Bucket",
+    y = "Number of Firms"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 18, hjust = 1))
+
+ggplot2::ggsave(OUTPUT_USABILITY_FILES$yearly_lines, yearly_coverage_plot, width = 10, height = 7, dpi = 160)
+ggplot2::ggsave(OUTPUT_USABILITY_FILES$joint_bars, joint_coverage_bar_plot, width = 10, height = 6, dpi = 160)
+ggplot2::ggsave(OUTPUT_USABILITY_FILES$sector_heatmap, sector_heatmap_plot, width = 11, height = 7.5, dpi = 160)
+ggplot2::ggsave(OUTPUT_USABILITY_FILES$missingness_bar, field_missingness_plot, width = 11, height = 10, dpi = 160)
+ggplot2::ggsave(OUTPUT_USABILITY_FILES$bucket_bar, bucket_plot, width = 10, height = 6, dpi = 160)
+
+yearly_coverage_plot
+```
+
+### Audit Validation Checks
+
+Assert invariants that must hold for the audit tables to be internally consistent:
+- Denominators match expected counts
+- Coverage rates are bounded in [0, 1]
+- Joint coverage never exceeds the min of its components
+- Snapshot coverage is constant across years (cross-sectional source)
+- Sector labels have been standardized
+- New dual-denominator definitions match legacy single-denominator figures
+
+```{r usability-validation}
+# ---- Cross-check new coverage definitions against legacy outputs ----
+legacy_compare <- coverage_by_year_dual %>%
+  filter(
+    denominator_type == "full_sample",
+    metric %in% c("price_available", "snapshot_available", "edgar_available")
+  ) %>%
+  select(year, metric, coverage_rate) %>%
+  pivot_wider(names_from = metric, values_from = coverage_rate) %>%
+  left_join(
+    legacy_coverage_by_year %>%
+      select(year, price_coverage, snapshot_coverage, edgar_coverage),
+    by = "year"
+  )
+
+joint_edgar_check <- coverage_by_year_dual %>%
+  select(year, denominator_type, metric, coverage_rate) %>%
+  pivot_wider(names_from = metric, values_from = coverage_rate) %>%
+  transmute(check = price_and_edgar <= pmin(price_available, edgar_available)) %>%
+  pull(check)
+
+joint_snapshot_check <- coverage_by_year_dual %>%
+  select(year, denominator_type, metric, coverage_rate) %>%
+  pivot_wider(names_from = metric, values_from = coverage_rate) %>%
+  transmute(check = price_and_snapshot <= pmin(price_available, snapshot_available)) %>%
+  pull(check)
+
+stopifnot(all(coverage_by_year_dual$denominator[coverage_by_year_dual$denominator_type == "full_sample"] == 503))
+stopifnot(all(coverage_by_year_dual$denominator[coverage_by_year_dual$denominator_type == "effective_sample"] <= 503))
+stopifnot(all(coverage_by_year_dual$coverage_rate[!is.na(coverage_by_year_dual$coverage_rate)] >= 0))
+stopifnot(all(coverage_by_year_dual$coverage_rate[!is.na(coverage_by_year_dual$coverage_rate)] <= 1))
+stopifnot(all(coverage_by_year_dual$coverage_rate[!is.na(coverage_by_year_dual$coverage_rate)] %>% is.finite()))
+stopifnot(all(joint_edgar_check[!is.na(joint_edgar_check)]))
+stopifnot(all(joint_snapshot_check[!is.na(joint_snapshot_check)]))
+stopifnot(
+  dplyr::n_distinct(
+    coverage_by_year_dual$coverage_rate[
+      coverage_by_year_dual$denominator_type == "full_sample" &
+        coverage_by_year_dual$metric == "snapshot_available"
+    ]
+  ) == 1
+)
+stopifnot(!any(panel_for_usability$sector_standardized %in% c("Technology", "Healthcare", "Financial Services"), na.rm = TRUE))
+stopifnot(all(round(legacy_compare$price_available, 4) == round(legacy_compare$price_coverage, 4)))
+stopifnot(all(round(legacy_compare$snapshot_available, 4) == round(legacy_compare$snapshot_coverage, 4)))
+stopifnot(all(round(legacy_compare$edgar_available, 4) == round(legacy_compare$edgar_coverage, 4)))
+
+validation_summary <- tibble(
+  check = c(
+    "Full-sample denominator is always 503",
+    "Effective-sample denominator never exceeds 503",
+    "All coverage rates lie within [0, 1]",
+    "Joint coverage never exceeds single-source coverage",
+    "Snapshot annual coverage is constant",
+    "Sector labels are standardized",
+    "New and legacy yearly coverage definitions match"
+  ),
+  result = "PASS"
+)
+
+knitr::kable(validation_summary)
+```
