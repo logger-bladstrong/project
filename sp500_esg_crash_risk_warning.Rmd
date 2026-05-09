@@ -2234,3 +2234,192 @@ ensure_warning_price_year <- function(year_value, output_file, price_map, force_
   data.table::fwrite(standardized_prices, output_file)
   standardized_prices
 }
+
+calc_classification_metrics <- function(actual, probability, threshold = 0.5) {
+  valid_index <- !is.na(actual) & !is.na(probability)
+  actual <- as.integer(actual[valid_index])
+  probability <- as.numeric(probability[valid_index])
+
+  if (length(actual) == 0) {
+    return(tibble())
+  }
+
+  predicted_class <- ifelse(probability >= threshold, 1L, 0L)
+  true_positive <- sum(predicted_class == 1 & actual == 1)
+  true_negative <- sum(predicted_class == 0 & actual == 0)
+  false_positive <- sum(predicted_class == 1 & actual == 0)
+  false_negative <- sum(predicted_class == 0 & actual == 1)
+
+  precision <- if ((true_positive + false_positive) == 0) NA_real_ else true_positive / (true_positive + false_positive)
+  recall <- if ((true_positive + false_negative) == 0) NA_real_ else true_positive / (true_positive + false_negative)
+  specificity <- if ((true_negative + false_positive) == 0) NA_real_ else true_negative / (true_negative + false_positive)
+  balanced_accuracy <- if (all(is.na(c(recall, specificity)))) {
+    NA_real_
+  } else {
+    mean(c(recall, specificity), na.rm = TRUE)
+  }
+  top20_summary <- calc_top_n_hit_summary(actual, probability, top_n = 20)
+
+  tibble(
+    selected_threshold = threshold,
+    n_eval = length(actual),
+    positive_count = sum(actual == 1),
+    positive_rate = mean(actual == 1),
+    predicted_positive_count = sum(predicted_class == 1),
+    accuracy = (true_positive + true_negative) / length(actual),
+    balanced_accuracy = balanced_accuracy,
+    precision = precision,
+    recall = recall,
+    specificity = specificity,
+    f0_5 = calc_fbeta(precision, recall, beta_weight = 0.5),
+    roc_auc = calc_roc_auc(actual, probability),
+    pr_auc = calc_pr_auc(actual, probability),
+    precision_at_top10 = calc_precision_at_top_share(actual, probability, share = 0.10),
+    top20_hit_rate = top20_summary$rate,
+    hits_in_top20 = top20_summary$hits,
+    top20_evaluated_n = top20_summary$k,
+    true_positive = true_positive,
+    true_negative = true_negative,
+    false_positive = false_positive,
+    false_negative = false_negative
+  )
+}
+
+build_threshold_metrics <- function(actual, probability, thresholds) {
+  bind_rows(lapply(thresholds, function(one_threshold) {
+    calc_classification_metrics(actual, probability, threshold = one_threshold) %>%
+      mutate(threshold = one_threshold)
+  }))
+}
+
+# ---- Build a labeled confusion matrix for model comparison ----
+build_confusion_matrix_table <- function(actual, probability, threshold = 0.5) {
+  valid_index <- !is.na(actual) & !is.na(probability)
+  actual <- as.integer(actual[valid_index])
+  probability <- as.numeric(probability[valid_index])
+
+  if (length(actual) == 0) {
+    return(tibble())
+  }
+
+  predicted_class <- ifelse(probability >= threshold, 1L, 0L)
+  true_positive <- sum(predicted_class == 1 & actual == 1)
+  true_negative <- sum(predicted_class == 0 & actual == 0)
+  false_positive <- sum(predicted_class == 1 & actual == 0)
+  false_negative <- sum(predicted_class == 0 & actual == 1)
+
+  tibble(
+    selected_threshold = threshold,
+    actual_class = c("Actual Crash", "Actual No Crash", "Actual No Crash", "Actual Crash"),
+    predicted_class = c("Predicted Crash", "Predicted No Crash", "Predicted Crash", "Predicted No Crash"),
+    cell = c("TP", "TN", "FP", "FN"),
+    count = c(true_positive, true_negative, false_positive, false_negative)
+  ) %>%
+    mutate(
+      n_eval = sum(count),
+      share = ifelse(n_eval > 0, count / n_eval, NA_real_)
+    )
+}
+
+fit_weighted_logistic_model_target <- function(train_data, apply_data, feature_cols, target_col, binary_features = character()) {
+  prepared_frames <- build_model_frame(
+    train_data = train_data,
+    apply_data = apply_data,
+    feature_cols = feature_cols,
+    binary_features = binary_features,
+    standardize = TRUE
+  )
+
+  target_vector <- as.integer(train_data[[target_col]])
+  positive_count <- sum(target_vector == 1, na.rm = TRUE)
+  negative_count <- sum(target_vector == 0, na.rm = TRUE)
+
+  if (positive_count == 0 || negative_count == 0) {
+    return(NULL)
+  }
+
+  case_weights <- ifelse(target_vector == 1, negative_count / positive_count, 1)
+  fit_data <- bind_cols(tibble(target = target_vector), prepared_frames$train)
+
+  glm_fit <- tryCatch(
+    glm(target ~ ., data = fit_data, family = binomial(), weights = case_weights),
+    error = function(error) NULL
+  )
+
+  if (is.null(glm_fit)) {
+    return(NULL)
+  }
+
+  predicted_probability <- as.numeric(predict(glm_fit, newdata = prepared_frames$apply, type = "response"))
+  predicted_probability <- pmin(pmax(predicted_probability, 1e-6), 1 - 1e-6)
+
+  coefficient_table <- summary(glm_fit)$coefficients
+
+  list(
+    probability = predicted_probability,
+    fitted_model = glm_fit,
+    coefficient_table = tibble(
+      term = rownames(coefficient_table),
+      estimate = as.numeric(coefficient_table[, 1]),
+      std_error = as.numeric(coefficient_table[, 2]),
+      statistic = as.numeric(coefficient_table[, 3]),
+      p_value = as.numeric(coefficient_table[, 4])
+    )
+  )
+}
+
+fit_ranger_probability_model_target <- function(train_data, apply_data, feature_cols, target_col, binary_features = character()) {
+  prepared_frames <- build_model_frame(
+    train_data = train_data,
+    apply_data = apply_data,
+    feature_cols = feature_cols,
+    binary_features = binary_features,
+    standardize = FALSE
+  )
+
+  target_vector <- as.integer(train_data[[target_col]])
+  positive_count <- sum(target_vector == 1, na.rm = TRUE)
+  negative_count <- sum(target_vector == 0, na.rm = TRUE)
+
+  if (positive_count == 0 || negative_count == 0) {
+    return(NULL)
+  }
+
+  case_weights <- ifelse(target_vector == 1, negative_count / positive_count, 1)
+  fit_data <- bind_cols(
+    tibble(target = factor(target_vector, levels = c(0, 1))),
+    prepared_frames$train
+  )
+
+  ranger_fit <- tryCatch(
+    ranger::ranger(
+      target ~ .,
+      data = fit_data,
+      probability = TRUE,
+      num.trees = 800,
+      importance = "impurity",
+      case.weights = case_weights,
+      seed = 20260425,
+      mtry = max(1, floor(sqrt(length(feature_cols))))
+    ),
+    error = function(error) NULL
+  )
+
+  if (is.null(ranger_fit)) {
+    return(NULL)
+  }
+
+  prediction_matrix <- predict(ranger_fit, data = prepared_frames$apply)$predictions
+  probability_column <- if ("1" %in% colnames(prediction_matrix)) prediction_matrix[, "1"] else prediction_matrix[, ncol(prediction_matrix)]
+
+  list(
+    probability = as.numeric(probability_column),
+    fitted_model = ranger_fit,
+    importance_table = tibble(
+      term = names(ranger_fit$variable.importance),
+      importance = as.numeric(ranger_fit$variable.importance)
+    ) %>%
+      arrange(desc(importance))
+  )
+}
+```
