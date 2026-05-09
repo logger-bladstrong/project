@@ -2423,3 +2423,69 @@ fit_ranger_probability_model_target <- function(train_data, apply_data, feature_
   )
 }
 ```
+
+### Build 2024-2025 Prices and Two-Year Labels
+
+```{r ml-warning-2y-prices-labels}
+price_map_ml <- final_panel %>%
+  distinct(symbol, company_name, cik, gics_sector, gics_sub_industry)
+
+price_2024 <- ensure_warning_price_year(
+  year_value = WARNING_EXTERNAL_START_YEAR,
+  output_file = DERIVED_ML_FILES$price_2024,
+  price_map = price_map_ml,
+  force_refresh = FORCE_REFRESH_WARNING_PRICES
+)
+
+price_2025 <- ensure_warning_price_year(
+  year_value = WARNING_EXTERNAL_END_YEAR,
+  output_file = DERIVED_ML_FILES$price_2025,
+  price_map = price_map_ml,
+  force_refresh = FORCE_REFRESH_WARNING_PRICES
+)
+
+price_daily_extended <- bind_rows(
+  price_daily %>%
+    select(price_symbol, date, adj_close, volume, symbol, company_name, cik, gics_sector, gics_sub_industry),
+  price_2024,
+  price_2025
+) %>%
+  distinct(symbol, date, .keep_all = TRUE) %>%
+  arrange(symbol, date)
+
+data.table::fwrite(price_daily_extended, DERIVED_ML_FILES$price_daily_extended)
+
+if (!file.exists(DERIVED_ML_FILES$crash_metrics_extended) || FORCE_REBUILD_WARNING_LABELS) {
+  message(">>> Rebuilding crash metrics through 2025")
+  crash_metrics_extended <- build_sp500_crash_metrics(price_daily_extended)
+  data.table::fwrite(crash_metrics_extended, DERIVED_ML_FILES$crash_metrics_extended)
+} else {
+  crash_metrics_extended <- readr::read_csv(
+    DERIVED_ML_FILES$crash_metrics_extended,
+    show_col_types = FALSE
+  )
+}
+
+crash_metrics_extended <- crash_metrics_extended %>%
+  mutate(
+    year = as.integer(year),
+    NCSKEW = as.numeric(NCSKEW),
+    CRASH_DUMMY = as.integer(CRASH_DUMMY),
+    SIGMA = as.numeric(SIGMA),
+    RET_MEAN = as.numeric(RET_MEAN),
+    DTURN = as.numeric(DTURN)
+  ) %>%
+  arrange(symbol, year)
+
+two_year_label_summary <- crash_metrics_extended %>%
+  filter(year >= 2013, year <= WARNING_EXTERNAL_END_YEAR) %>%
+  group_by(year) %>%
+  summarise(
+    firms_with_label = n(),
+    crash_rate = mean(CRASH_DUMMY, na.rm = TRUE),
+    mean_ncskew = mean(NCSKEW, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+two_year_label_summary %>% knitr::kable(digits = 4)
+```
