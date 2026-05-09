@@ -1797,3 +1797,203 @@ fetch_yahoo_prices_python <- function(tickers, start_date, end_date_exclusive, o
   if (!file.exists(output_file)) {
     stop("The Python Yahoo download fallback did not create the expected price file.")
   }
+
+  command_output
+}
+
+# ---------------------------------------------------------------------------
+# Crash-risk label construction (following Chen, Hong & Stein 2001 / JFE)
+# ---------------------------------------------------------------------------
+# Crash metrics are computed from weekly residual returns after removing
+# market-wide movements. The key steps:
+#   1. Aggregate daily log returns to weekly
+#   2. Regress firm weekly returns on lead/lag market returns (Dimson 1979)
+#   3. Compute NCSKEW (negative conditional skewness) and CRASH_DUMMY from residuals
+# A "crash" week is any residual return below mean - 3.09 * sd (~0.1% tail).
+
+compute_symbol_year_crash_metrics <- function(firm_data) {
+  n_obs <- nrow(firm_data)
+  if (n_obs < 26) {
+    return(NULL)
+  }
+
+  firm_sorted <- firm_data %>%
+    arrange(week_id) %>%
+    mutate(
+      mkt_lag2 = lag(ret_market, 2),
+      mkt_lag1 = lag(ret_market, 1),
+      mkt_lead1 = lead(ret_market, 1),
+      mkt_lead2 = lead(ret_market, 2)
+    )
+
+  reg_data <- firm_sorted %>%
+    filter(
+      !is.na(mkt_lag2), !is.na(mkt_lag1),
+      !is.na(ret_market), !is.na(mkt_lead1), !is.na(mkt_lead2)
+    )
+
+  if (nrow(reg_data) < 20) {
+    return(NULL)
+  }
+
+  # Regress firm weekly returns on lead/lag market returns to isolate firm-specific residual moves.
+  fit <- tryCatch(
+    lm(ret_week ~ mkt_lag2 + mkt_lag1 + ret_market + mkt_lead1 + mkt_lead2, data = reg_data),
+    error = function(error) NULL
+  )
+
+  if (is.null(fit)) {
+    return(NULL)
+  }
+
+  residual_returns <- residuals(fit)
+  transformed_returns <- log(1 + residual_returns)
+  transformed_returns <- transformed_returns[is.finite(transformed_returns)]
+
+  n <- length(transformed_returns)
+  if (n < 20) {
+    return(NULL)
+  }
+
+  sum_w3 <- sum(transformed_returns^3)
+  sum_w2 <- sum(transformed_returns^2)
+
+  ncskew <- NA_real_
+  if (sum_w2 > 0) {
+    ncskew <- -(n * (n - 1)^(1.5) * sum_w3) / ((n - 1) * (n - 2) * sum_w2^(1.5))
+  }
+
+  w_mean <- mean(transformed_returns, na.rm = TRUE)
+  w_sd <- sd(transformed_returns, na.rm = TRUE)
+  # A crash year is flagged when at least one residual return breaches the 3.09-standard-deviation cutoff.
+  crash_dummy <- as.integer(any(transformed_returns < w_mean - 3.09 * w_sd, na.rm = TRUE))
+
+  tibble(
+    NCSKEW = ncskew,
+    CRASH_DUMMY = crash_dummy,
+    SIGMA = w_sd,
+    RET_MEAN = w_mean
+  )
+}
+
+build_sp500_crash_metrics <- function(price_data) {
+  # Build weekly firm and market returns because the crash-risk labels are defined on weekly residuals.
+  daily_returns <- price_data %>%
+    arrange(symbol, date) %>%
+    group_by(symbol) %>%
+    mutate(ret_daily = log(adj_close / lag(adj_close))) %>%
+    ungroup() %>%
+    filter(!is.na(ret_daily), is.finite(ret_daily))
+
+  market_daily <- daily_returns %>%
+    group_by(date) %>%
+    summarise(
+      ret_market = mean(ret_daily, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  daily_with_week <- daily_returns %>%
+    left_join(market_daily, by = "date") %>%
+    mutate(
+      year = lubridate::year(date),
+      week_id = paste0(year, "_W", sprintf("%02d", lubridate::isoweek(date)))
+    )
+
+  weekly_returns <- daily_with_week %>%
+    group_by(symbol, year, week_id) %>%
+    summarise(
+      ret_week = sum(ret_daily, na.rm = TRUE),
+      ret_market = sum(ret_market, na.rm = TRUE),
+      avg_volume = mean(volume, na.rm = TRUE),
+      n_days = n(),
+      .groups = "drop"
+    ) %>%
+    filter(n_days >= 3)
+
+  symbol_year_groups <- weekly_returns %>%
+    group_by(symbol, year) %>%
+    group_split()
+
+  crash_rows <- lapply(symbol_year_groups, function(group_data) {
+    metric_row <- compute_symbol_year_crash_metrics(group_data)
+    if (is.null(metric_row)) {
+      return(NULL)
+    }
+
+    bind_cols(
+      tibble(symbol = group_data$symbol[[1]], year = group_data$year[[1]]),
+      metric_row
+    )
+  })
+
+  crash_metrics_df <- bind_rows(Filter(Negate(is.null), crash_rows))
+
+  monthly_volume <- daily_returns %>%
+    mutate(
+      year = lubridate::year(date),
+      month = lubridate::month(date)
+    ) %>%
+    group_by(symbol, year, month) %>%
+    summarise(
+      monthly_volume = sum(volume, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  annual_volume <- monthly_volume %>%
+    group_by(symbol, year) %>%
+    summarise(
+      avg_monthly_volume = mean(monthly_volume, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # DTURN captures the year-over-year change in average monthly trading volume.
+  dturn_df <- annual_volume %>%
+    arrange(symbol, year) %>%
+    group_by(symbol) %>%
+    mutate(DTURN = avg_monthly_volume - lag(avg_monthly_volume)) %>%
+    ungroup() %>%
+    select(symbol, year, DTURN)
+
+  crash_metrics_df %>%
+    left_join(dturn_df, by = c("symbol", "year")) %>%
+    arrange(symbol, year)
+}
+
+# ---------------------------------------------------------------------------
+# Classification metrics (all handle NA values via valid_index filtering)
+# ---------------------------------------------------------------------------
+# ROC AUC computed via the Wilcoxon-Mann-Whitney rank-sum formula
+
+calc_roc_auc <- function(truth, probability) {
+  truth <- as.integer(truth)
+  valid_index <- !is.na(truth) & !is.na(probability)
+  truth <- truth[valid_index]
+  probability <- probability[valid_index]
+
+  positive_total <- sum(truth == 1)
+  negative_total <- sum(truth == 0)
+
+  if (positive_total == 0 || negative_total == 0) {
+    return(NA_real_)
+  }
+
+  ranks <- rank(probability, ties.method = "average")
+  positive_rank_sum <- sum(ranks[truth == 1])
+
+  (positive_rank_sum - positive_total * (positive_total + 1) / 2) / (positive_total * negative_total)
+}
+
+# PR AUC via the trapezoidal rule on sorted predictions
+calc_pr_auc <- function(truth, probability) {
+  truth <- as.integer(truth)
+  valid_index <- !is.na(truth) & !is.na(probability)
+  truth <- truth[valid_index]
+  probability <- probability[valid_index]
+
+  positive_total <- sum(truth == 1)
+  if (positive_total == 0) {
+    return(NA_real_)
+  }
+
+  order_index <- order(probability, decreasing = TRUE)
+  sorted_truth <- truth[order_index]
