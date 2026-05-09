@@ -1644,3 +1644,26 @@ validation_summary <- tibble(
 
 knitr::kable(validation_summary)
 ```
+
+### Usability Analysis Output Files
+
+```{r usability-output-files}
+usability_output_table <- tibble(
+  file = to_project_relative(unname(unlist(OUTPUT_USABILITY_FILES))),
+  description = c(
+    "Dual-denominator usability overview",
+    "Dual-denominator coverage by year",
+    "Dual-denominator coverage by sector",
+    "Field missingness summary for the main panel",
+    "Coverage distribution by firm-level usability bucket",
+    "Special sample and boundary-case summary",
+    "Line chart of dual-denominator coverage by year",
+    "Yearly bar chart for jointly available samples",
+    "Sector coverage heatmap",
+    "Field missingness bar chart",
+    "Firm coverage bucket distribution"
+  )
+)
+
+knitr::kable(usability_output_table)
+```
