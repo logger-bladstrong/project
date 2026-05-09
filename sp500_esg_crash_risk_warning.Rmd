@@ -2778,3 +2778,518 @@ for (spec_index in seq_len(nrow(model_specifications))) {
     validation_threshold_results[[length(validation_threshold_results) + 1]] <- threshold_metrics
   }
 }
+
+validation_fold_metrics <- bind_rows(validation_fold_results)
+validation_threshold_metrics <- bind_rows(validation_threshold_results)
+
+threshold_selection <- validation_threshold_metrics %>%
+  group_by(model_key, model_display, feature_set_id, feature_set_label, model_type, model_label, threshold) %>%
+  summarise(
+    mean_accuracy = mean(accuracy, na.rm = TRUE),
+    mean_balanced_accuracy = mean(balanced_accuracy, na.rm = TRUE),
+    mean_precision = mean(precision, na.rm = TRUE),
+    mean_recall = mean(recall, na.rm = TRUE),
+    mean_f0_5 = mean(f0_5, na.rm = TRUE),
+    mean_pr_auc_proxy = mean(pr_auc, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(model_key, model_display, feature_set_id, feature_set_label, model_type, model_label) %>%
+  group_modify(~ choose_threshold_from_validation(.x)) %>%
+  ungroup() %>%
+  rename(selected_threshold = threshold)
+
+cv_model_comparison <- validation_fold_metrics %>%
+  group_by(model_key, model_display, feature_set_id, feature_set_label, model_type, model_label) %>%
+  summarise(
+    fold_count = n(),
+    mean_accuracy = mean(accuracy, na.rm = TRUE),
+    mean_balanced_accuracy = mean(balanced_accuracy, na.rm = TRUE),
+    mean_precision = mean(precision, na.rm = TRUE),
+    mean_recall = mean(recall, na.rm = TRUE),
+    mean_f0_5 = mean(f0_5, na.rm = TRUE),
+    mean_roc_auc = mean(roc_auc, na.rm = TRUE),
+    mean_pr_auc = mean(pr_auc, na.rm = TRUE),
+    mean_precision_at_top10 = mean(precision_at_top10, na.rm = TRUE),
+    mean_top20_hit_rate = mean(top20_hit_rate, na.rm = TRUE),
+    mean_train_positive_rate = mean(train_positive_rate, na.rm = TRUE),
+    mean_validation_positive_rate = mean(validation_positive_rate, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    threshold_selection %>%
+      select(model_key, selected_threshold, mean_accuracy, mean_balanced_accuracy, mean_precision, mean_recall, mean_f0_5),
+    by = "model_key",
+    suffix = c("_cv", "_threshold")
+  ) %>%
+  arrange(desc(mean_pr_auc), desc(mean_precision_at_top10), desc(mean_f0_5_cv), desc(mean_accuracy_cv), model_type)
+
+best_overall_model <- cv_model_comparison %>%
+  arrange(desc(mean_pr_auc), desc(mean_precision_at_top10), desc(mean_f0_5_cv), desc(mean_accuracy_cv), model_type) %>%
+  slice(1)
+
+best_logistic_model <- cv_model_comparison %>%
+  filter(model_type == "weighted_logistic") %>%
+  arrange(desc(mean_pr_auc), desc(mean_precision_at_top10), desc(mean_f0_5_cv), desc(mean_accuracy_cv)) %>%
+  slice(1)
+
+best_forest_model <- cv_model_comparison %>%
+  filter(model_type == "ranger_probability_forest") %>%
+  arrange(desc(mean_pr_auc), desc(mean_precision_at_top10), desc(mean_f0_5_cv), desc(mean_accuracy_cv)) %>%
+  slice(1)
+
+data.table::fwrite(validation_fold_metrics, OUTPUT_ML_FILES$validation_fold_metrics)
+data.table::fwrite(validation_threshold_metrics, OUTPUT_ML_FILES$threshold_tuning)
+data.table::fwrite(cv_model_comparison, OUTPUT_ML_FILES$cv_model_comparison)
+
+cv_model_comparison %>%
+  select(model_display, mean_pr_auc, mean_precision_at_top10, mean_f0_5_cv, mean_accuracy_cv, selected_threshold) %>%
+  knitr::kable(digits = 4)
+```
+
+### 2024-2025 Two-Year External Validation and Warning Outputs
+
+The two-year external test uses 2023 features to predict crashes in the 2024-2025
+window. Since 2025 crash labels are now realized, this provides an additional
+out-of-sample check beyond the one-year 2024-only test.
+
+Additional outputs vs. one-year:
+- Confusion matrices (all models + champion only)
+- Accuracy/precision/recall/F0.5 comparison bar chart
+- Two-year champion model's top-20 high-risk company list
+
+```{r ml-warning-2y-external-validation}
+external_prediction_results <- list()
+logistic_coefficient_tables <- list()
+forest_importance_tables <- list()
+pr_curve_tables <- list()
+
+for (spec_index in seq_len(nrow(model_specifications))) {
+  one_spec <- model_specifications[spec_index, ]
+  feature_columns <- one_spec$feature_columns[[1]]
+  binary_columns <- one_spec$binary_columns[[1]]
+
+  fitted_output <- if (one_spec$model_type[[1]] == "weighted_logistic") {
+    fit_weighted_logistic_model_target(
+      train_data = training_pool,
+      apply_data = external_test_pool,
+      feature_cols = feature_columns,
+      target_col = "future_2y_crash_dummy",
+      binary_features = binary_columns
+    )
+  } else {
+    fit_ranger_probability_model_target(
+      train_data = training_pool,
+      apply_data = external_test_pool,
+      feature_cols = feature_columns,
+      target_col = "future_2y_crash_dummy",
+      binary_features = binary_columns
+    )
+  }
+
+  if (is.null(fitted_output)) {
+    next
+  }
+
+  final_threshold <- threshold_selection %>%
+    filter(model_key == one_spec$model_key[[1]]) %>%
+    pull(selected_threshold)
+
+  if (length(final_threshold) == 0 || is.na(final_threshold[[1]])) {
+    final_threshold <- 0.5
+  } else {
+    final_threshold <- final_threshold[[1]]
+  }
+
+  final_prediction <- external_test_pool %>%
+    transmute(
+      model_key = one_spec$model_key[[1]],
+      model_display = one_spec$model_display[[1]],
+      feature_set_id = one_spec$feature_set_id[[1]],
+      feature_set_label = one_spec$feature_set_label[[1]],
+      model_type = one_spec$model_type[[1]],
+      model_label = one_spec$model_label[[1]],
+      symbol,
+      company_name,
+      sector_standardized,
+      feature_year,
+      window_start_year,
+      window_end_year,
+      crash_t1,
+      crash_t2,
+      ncskew_t1,
+      ncskew_t2,
+      future_2y_crash_dummy,
+      risk_probability = fitted_output$probability
+    ) %>%
+    mutate(
+      selected_threshold = final_threshold,
+      warning_flag = risk_probability >= selected_threshold,
+      risk_rank = min_rank(desc(risk_probability))
+    )
+
+  external_prediction_results[[length(external_prediction_results) + 1]] <- final_prediction
+
+  if (!is.null(fitted_output$coefficient_table)) {
+    logistic_coefficient_tables[[one_spec$model_key[[1]]]] <- fitted_output$coefficient_table %>%
+      mutate(
+        model_key = one_spec$model_key[[1]],
+        model_display = one_spec$model_display[[1]]
+      )
+  }
+
+  if (!is.null(fitted_output$importance_table)) {
+    forest_importance_tables[[one_spec$model_key[[1]]]] <- fitted_output$importance_table %>%
+      mutate(
+        model_key = one_spec$model_key[[1]],
+        model_display = one_spec$model_display[[1]]
+      )
+  }
+
+  pr_curve_tables[[one_spec$model_key[[1]]]] <- build_pr_curve_data(
+    actual = final_prediction$future_2y_crash_dummy,
+    probability = final_prediction$risk_probability,
+    model_label = one_spec$model_display[[1]]
+  )
+}
+
+external_predictions <- bind_rows(external_prediction_results)
+logistic_coefficients_all <- bind_rows(logistic_coefficient_tables)
+forest_importance_all <- bind_rows(forest_importance_tables)
+pr_curve_2y <- bind_rows(pr_curve_tables)
+
+external_test_metrics <- external_predictions %>%
+  group_by(model_key, model_display, feature_set_id, feature_set_label, model_type, model_label) %>%
+  group_modify(~ {
+    threshold_value <- unique(.x$selected_threshold)[1]
+    calc_classification_metrics(.x$future_2y_crash_dummy, .x$risk_probability, threshold = threshold_value)
+  }) %>%
+  ungroup() %>%
+  arrange(desc(pr_auc), desc(precision_at_top10), desc(f0_5), desc(accuracy))
+
+confusion_matrix_by_model <- external_predictions %>%
+  group_by(model_key, model_display, feature_set_id, feature_set_label, model_type, model_label) %>%
+  group_modify(~ {
+    threshold_value <- unique(.x$selected_threshold)[1]
+    build_confusion_matrix_table(.x$future_2y_crash_dummy, .x$risk_probability, threshold = threshold_value)
+  }) %>%
+  ungroup()
+
+champion_model_key <- best_overall_model$model_key[[1]]
+champion_predictions <- external_predictions %>%
+  filter(model_key == champion_model_key) %>%
+  arrange(risk_rank)
+
+champion_model_label <- if (nrow(champion_predictions) > 0) champion_predictions$model_display[[1]] else "No model available"
+
+top_risk_companies_2y <- champion_predictions %>%
+  slice_head(n = 20) %>%
+  select(
+    model_display,
+    symbol,
+    company_name,
+    sector_standardized,
+    feature_year,
+    window_start_year,
+    window_end_year,
+    risk_probability,
+    selected_threshold,
+    warning_flag,
+    crash_t1,
+    crash_t2,
+    future_2y_crash_dummy,
+    risk_rank
+  )
+
+baseline_external <- external_test_metrics %>%
+  filter(feature_set_id == "price_baseline") %>%
+  arrange(desc(pr_auc), desc(precision_at_top10), desc(f0_5), desc(accuracy)) %>%
+  slice(1)
+
+best_esg_external <- external_test_metrics %>%
+  filter(feature_set_id != "price_baseline") %>%
+  arrange(desc(pr_auc), desc(precision_at_top10), desc(f0_5), desc(accuracy)) %>%
+  slice(1)
+
+esg_gain_summary <- tibble(
+  baseline_model = baseline_external$model_display,
+  baseline_pr_auc = baseline_external$pr_auc,
+  baseline_precision_at_top10 = baseline_external$precision_at_top10,
+  best_esg_model = best_esg_external$model_display,
+  best_esg_pr_auc = best_esg_external$pr_auc,
+  best_esg_precision_at_top10 = best_esg_external$precision_at_top10,
+  esg_adds_value = ifelse(
+    best_esg_external$pr_auc > baseline_external$pr_auc |
+      best_esg_external$precision_at_top10 > baseline_external$precision_at_top10,
+    "YES",
+    "NO"
+  )
+)
+
+data.table::fwrite(external_test_metrics, OUTPUT_ML_FILES$test_metrics)
+data.table::fwrite(confusion_matrix_by_model, OUTPUT_ML_FILES$confusion_matrix)
+data.table::fwrite(external_predictions, OUTPUT_ML_FILES$company_predictions)
+data.table::fwrite(top_risk_companies_2y, OUTPUT_ML_FILES$top_risk_companies)
+
+pr_curve_plot <- pr_curve_2y %>%
+  ggplot(aes(x = recall, y = precision, color = model_label)) +
+  geom_line(linewidth = 1) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title = "2024-2025 External Test PR Curve",
+    x = "Recall",
+    y = "Precision",
+    color = "Model"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+accuracy_precision_plot_data <- external_test_metrics %>%
+  select(model_display, accuracy, balanced_accuracy, precision, recall, f0_5) %>%
+  pivot_longer(
+    cols = -model_display,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(
+      metric,
+      levels = c("accuracy", "balanced_accuracy", "precision", "recall", "f0_5"),
+      labels = c("Accuracy", "Balanced Accuracy", "Precision", "Recall", "F0.5")
+    ),
+    model_display = factor(model_display, levels = rev(unique(external_test_metrics$model_display)))
+  )
+
+accuracy_precision_plot <- accuracy_precision_plot_data %>%
+  ggplot(aes(x = model_display, y = value, fill = metric)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.72) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "2024-2025 External Test Accuracy and Precision Profile",
+    x = "Model",
+    y = "Metric Value",
+    fill = "Metric"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+confusion_matrix_plot_data <- confusion_matrix_by_model %>%
+  mutate(
+    actual_class = factor(actual_class, levels = c("Actual Crash", "Actual No Crash")),
+    predicted_class = factor(predicted_class, levels = c("Predicted Crash", "Predicted No Crash")),
+    cell_label = paste0("n = ", count, "\n", scales::percent(share, accuracy = 0.1))
+  )
+
+confusion_matrix_all_plot <- confusion_matrix_plot_data %>%
+  ggplot(aes(x = predicted_class, y = actual_class, fill = share)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(aes(label = cell_label), size = 3.2, lineheight = 0.95) +
+  facet_wrap(~ model_display) +
+  scale_fill_gradient(low = "#F3F4F6", high = "#2F6DB3", labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "2024-2025 Confusion Matrix by Model",
+    x = "Predicted Class",
+    y = "Actual Class",
+    fill = "Share"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid = element_blank()
+  )
+
+champion_confusion_plot <- confusion_matrix_plot_data %>%
+  filter(model_key == champion_model_key) %>%
+  ggplot(aes(x = predicted_class, y = actual_class, fill = share)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(aes(label = cell_label), size = 5, lineheight = 0.95) +
+  scale_fill_gradient(low = "#F3F4F6", high = "#2F6DB3", labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Champion Model Confusion Matrix (2024-2025)",
+    subtitle = champion_model_label,
+    x = "Predicted Class",
+    y = "Actual Class",
+    fill = "Share"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    panel.grid = element_blank()
+  )
+
+top_risk_plot <- top_risk_companies_2y %>%
+  mutate(company_name = reorder(company_name, risk_probability)) %>%
+  ggplot(aes(x = company_name, y = risk_probability, fill = factor(future_2y_crash_dummy, levels = c(0, 1)))) +
+  geom_col(width = 0.75) +
+  coord_flip() +
+  scale_fill_manual(values = c("0" = "#BDBDBD", "1" = "#D95F02"), labels = c("0" = "No Crash in 2024-2025", "1" = "Crash in 2024-2025")) +
+  labs(
+    title = "Top 20 High-Risk Companies for 2024-2025",
+    subtitle = paste0("Champion model: ", champion_model_label),
+    x = "Company",
+    y = "Risk Probability",
+    fill = "Observed Outcome"
+  ) +
+  theme_minimal(base_size = 12)
+
+best_logistic_key <- if (nrow(best_logistic_model) > 0) best_logistic_model$model_key[[1]] else NA_character_
+best_logistic_label <- if (nrow(best_logistic_model) > 0) best_logistic_model$model_display[[1]] else "No logistic model available"
+
+best_logistic_coefficients <- logistic_coefficients_all %>%
+  filter(model_key == best_logistic_key, term != "(Intercept)") %>%
+  mutate(abs_estimate = abs(estimate)) %>%
+  slice_max(abs_estimate, n = 15, with_ties = FALSE) %>%
+  arrange(estimate) %>%
+  mutate(term = factor(term, levels = term))
+
+logistic_coef_plot <- if (nrow(best_logistic_coefficients) > 0) {
+  best_logistic_coefficients %>%
+    ggplot(aes(x = term, y = estimate, fill = estimate > 0)) +
+    geom_col(show.legend = FALSE) +
+    coord_flip() +
+    scale_fill_manual(values = c("TRUE" = "#2F6DB3", "FALSE" = "#D95F02")) +
+    labs(
+      title = "Best Logistic Model Coefficients (2-Year Warning)",
+      subtitle = best_logistic_label,
+      x = "Feature",
+      y = "Coefficient Estimate"
+    ) +
+    theme_minimal(base_size = 12)
+} else {
+  ggplot() +
+    annotate("text", x = 1, y = 1, label = "No logistic coefficients available") +
+    labs(title = "Best Logistic Model Coefficients (2-Year Warning)") +
+    theme_void()
+}
+
+best_forest_key <- if (nrow(best_forest_model) > 0) best_forest_model$model_key[[1]] else NA_character_
+best_forest_label <- if (nrow(best_forest_model) > 0) best_forest_model$model_display[[1]] else "No forest model available"
+
+best_forest_importance <- forest_importance_all %>%
+  filter(model_key == best_forest_key) %>%
+  slice_max(importance, n = 15, with_ties = FALSE) %>%
+  arrange(importance) %>%
+  mutate(term = factor(term, levels = term))
+
+forest_importance_plot <- if (nrow(best_forest_importance) > 0) {
+  best_forest_importance %>%
+    ggplot(aes(x = term, y = importance)) +
+    geom_col(fill = "#2F6DB3", width = 0.75) +
+    coord_flip() +
+    labs(
+      title = "Best Probability Forest Feature Importance (2-Year Warning)",
+      subtitle = best_forest_label,
+      x = "Feature",
+      y = "Importance"
+    ) +
+    theme_minimal(base_size = 12)
+} else {
+  ggplot() +
+    annotate("text", x = 1, y = 1, label = "No forest importance available") +
+    labs(title = "Best Probability Forest Feature Importance (2-Year Warning)") +
+    theme_void()
+}
+
+ggplot2::ggsave(OUTPUT_ML_FILES$pr_curve, pr_curve_plot, width = 9.5, height = 6.2, dpi = 160)
+ggplot2::ggsave(OUTPUT_ML_FILES$accuracy_precision_plot, accuracy_precision_plot, width = 10.5, height = 6.8, dpi = 160)
+ggplot2::ggsave(OUTPUT_ML_FILES$confusion_all_plot, confusion_matrix_all_plot, width = 12, height = 8, dpi = 160)
+ggplot2::ggsave(OUTPUT_ML_FILES$confusion_champion_plot, champion_confusion_plot, width = 7.5, height = 6.5, dpi = 160)
+ggplot2::ggsave(OUTPUT_ML_FILES$top_risk_plot, top_risk_plot, width = 10, height = 7, dpi = 160)
+ggplot2::ggsave(OUTPUT_ML_FILES$logistic_coef_plot, logistic_coef_plot, width = 10, height = 7, dpi = 160)
+ggplot2::ggsave(OUTPUT_ML_FILES$forest_importance_plot, forest_importance_plot, width = 10, height = 7, dpi = 160)
+
+external_test_metrics %>%
+  select(model_display, pr_auc, roc_auc, accuracy, balanced_accuracy, precision, recall, f0_5, precision_at_top10, top20_hit_rate, selected_threshold) %>%
+  knitr::kable(digits = 4)
+
+esg_gain_summary %>% knitr::kable(digits = 4)
+```
+
+### Two-Year Machine Learning Validation Checks
+
+Assert invariants for the two-year setup:
+- Window boundaries align correctly with feature years
+- Training pool excludes realized 2025 labels
+- 2-year label exactly equals crash_t1 | crash_t2
+- Confusion matrix cell counts sum to evaluation sample size
+
+```{r ml-warning-2y-validation}
+# ---- Verify two-year temporal alignment ----
+stopifnot(all(training_pool$window_start_year == training_pool$feature_year + 1L))
+stopifnot(all(training_pool$window_end_year == training_pool$feature_year + WARNING_LOOKAHEAD_YEARS))
+stopifnot(!any(training_pool$window_end_year == WARNING_EXTERNAL_END_YEAR))
+stopifnot(all(external_test_pool$feature_year == END_YEAR))
+stopifnot(all(external_test_pool$window_start_year == WARNING_EXTERNAL_START_YEAR))
+stopifnot(all(external_test_pool$window_end_year == WARNING_EXTERNAL_END_YEAR))
+stopifnot(!any(is.na(training_pool$future_2y_crash_dummy)))
+stopifnot(all(
+  ml_warning_panel_2y$future_2y_crash_dummy[ml_warning_panel_2y$window_complete] ==
+    as.integer(
+      ml_warning_panel_2y$crash_t1[ml_warning_panel_2y$window_complete] == 1L |
+        ml_warning_panel_2y$crash_t2[ml_warning_panel_2y$window_complete] == 1L
+    )
+))
+stopifnot(nrow(external_test_metrics) == nrow(model_specifications))
+stopifnot(all(external_test_metrics$selected_threshold >= 0.05 & external_test_metrics$selected_threshold <= 0.95))
+stopifnot(all(external_test_metrics$accuracy >= 0 & external_test_metrics$accuracy <= 1))
+stopifnot(all(external_test_metrics$balanced_accuracy[!is.na(external_test_metrics$balanced_accuracy)] >= 0 & external_test_metrics$balanced_accuracy[!is.na(external_test_metrics$balanced_accuracy)] <= 1))
+stopifnot(all(external_test_metrics$pr_auc[!is.na(external_test_metrics$pr_auc)] >= 0 & external_test_metrics$pr_auc[!is.na(external_test_metrics$pr_auc)] <= 1))
+stopifnot(all(external_test_metrics$roc_auc[!is.na(external_test_metrics$roc_auc)] >= 0 & external_test_metrics$roc_auc[!is.na(external_test_metrics$roc_auc)] <= 1))
+stopifnot(all(external_predictions$risk_rank >= 1))
+
+confusion_validation <- confusion_matrix_by_model %>%
+  group_by(model_key) %>%
+  summarise(total_count = sum(count), .groups = "drop") %>%
+  inner_join(external_test_metrics %>% select(model_key, n_eval), by = "model_key")
+
+stopifnot(all(confusion_validation$total_count == confusion_validation$n_eval))
+
+ml_validation_summary_2y <- tibble(
+  check = c(
+    "window_start_year always equals feature_year + 1",
+    "window_end_year always equals feature_year + 2",
+    "Training pool excludes realized 2025 labels",
+    "External test uses 2023 features and validates 2024-2025",
+    "The 2-year label equals a crash in either of the next two years",
+    "Accuracy / Balanced Accuracy / PR AUC / ROC AUC lie within [0, 1]",
+    "Confusion matrix cells sum to the external test sample size"
+  ),
+  result = "PASS"
+)
+
+knitr::kable(ml_validation_summary_2y)
+```
+
+### Two-Year Machine Learning Output Files
+
+```{r ml-warning-2y-output-files}
+ml_output_table_2y <- tibble(
+  file = to_project_relative(c(unname(unlist(DERIVED_ML_FILES)), unname(unlist(OUTPUT_ML_FILES)))),
+  description = c(
+    "Cached 2024 daily price data used for the 2-year warning task",
+    "Newly fetched 2025 daily price data",
+    "Extended 2011-2025 daily price table",
+    "Extended 2012-2025 annual crash label table",
+    "ML base panel linking 2012-2023 features to 2-year forward labels",
+    "2-year training sample export",
+    "2-year validation fold metrics by feature year",
+    "2-year threshold search results across validation folds",
+    "2-year cross-validation model comparison",
+    "2024-2025 external test metrics table",
+    "2024-2025 confusion matrix table by model",
+    "2024-2025 company-level prediction table",
+    "2024-2025 high-risk company list",
+    "2024-2025 external test PR curve",
+    "2024-2025 accuracy and precision comparison chart",
+    "2024-2025 confusion matrix chart for all models",
+    "2024-2025 confusion matrix chart for the champion model",
+    "2024-2025 Top high-risk companies chart",
+    "Best logistic coefficient chart for the 2-year task",
+    "Best forest feature importance chart for the 2-year task"
+  )
+)
+
+knit::kable(ml_output_table_2y)
+```
+
