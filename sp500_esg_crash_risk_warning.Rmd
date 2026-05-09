@@ -1186,3 +1186,280 @@ classify_panel_field_group <- function(field_name) {
 # The full-sample denominator is always 503 (or the total distinct symbols in the panel)
 full_sample_denominator <- dplyr::n_distinct(panel_for_usability$symbol)
 ```
+
+### Coverage Summary and CSV Export
+
+The dual-denominator coverage tables are built by pivoting the five availability
+indicators into long form and computing rates under both denominator definitions.
+
+```{r usability-tables}
+# ---- Pivot availability indicators to long format for grouped aggregation ----
+firm_year_metric_long <- panel_for_usability %>%
+  select(
+    year,
+    symbol,
+    sector_standardized,
+    eligible_by_year,
+    all_of(metric_levels)
+  ) %>%
+  pivot_longer(
+    cols = all_of(metric_levels),
+    names_to = "metric",
+    values_to = "available"
+  ) %>%
+  mutate(
+    available = coalesce(as.logical(available), FALSE),
+    metric = factor(metric, levels = metric_levels, ordered = TRUE),
+    metric_label = unname(metric_labels[as.character(metric)])
+  )
+
+# ---- Full-sample coverage: denominator = all 503 firms, every year ----
+coverage_by_year_full <- firm_year_metric_long %>%
+  group_by(year, metric, metric_label) %>%
+  summarise(
+    numerator = sum(available, na.rm = TRUE),
+    denominator = full_sample_denominator,
+    coverage_rate = numerator / denominator,
+    denominator_type = "full_sample",
+    .groups = "drop"
+  )
+
+# ---- Effective-sample coverage: denominator = only post-index-entry firm-years ----
+coverage_by_year_effective <- firm_year_metric_long %>%
+  filter(eligible_by_year) %>%
+  group_by(year, metric, metric_label) %>%
+  summarise(
+    numerator = sum(available, na.rm = TRUE),
+    denominator = n(),
+    coverage_rate = if_else(denominator > 0, numerator / denominator, NA_real_),
+    denominator_type = "effective_sample",
+    .groups = "drop"
+  )
+
+# ---- Combine full-sample and effective-sample into one dual-denominator table ----
+coverage_by_year_dual <- bind_rows(
+  coverage_by_year_full,
+  coverage_by_year_effective
+) %>%
+  mutate(
+    denominator_label = unname(denominator_labels[denominator_type])
+  ) %>%
+  arrange(denominator_type, year, metric)
+
+overall_coverage_dual <- bind_rows(
+  firm_year_metric_long %>%
+    group_by(metric, metric_label) %>%
+    summarise(
+      numerator = sum(available, na.rm = TRUE),
+      denominator = n(),
+      coverage_rate = numerator / denominator,
+      denominator_type = "full_sample",
+      .groups = "drop"
+    ),
+  firm_year_metric_long %>%
+    filter(eligible_by_year) %>%
+    group_by(metric, metric_label) %>%
+    summarise(
+      numerator = sum(available, na.rm = TRUE),
+      denominator = n(),
+      coverage_rate = if_else(denominator > 0, numerator / denominator, NA_real_),
+      denominator_type = "effective_sample",
+      .groups = "drop"
+    )
+) %>%
+  mutate(
+    summary_group = "coverage",
+    denominator_label = unname(denominator_labels[denominator_type])
+  )
+
+overview_base <- tibble(
+  summary_group = "base",
+  denominator_type = "not_applicable",
+  denominator_label = "Not Applicable",
+  metric = c(
+    "constituent_rows",
+    "years_in_panel",
+    "panel_rows",
+    "firms_with_any_price",
+    "firms_with_any_snapshot",
+    "firms_with_any_edgar",
+    "companies_missing_date_added",
+    "companies_missing_cik"
+  ),
+  metric_label = c(
+    "Number of Firms",
+    "Number of Years",
+    "Firm-Year Rows",
+    "Firms with Price Data in At Least One Year",
+    "Firms with Snapshot ESG",
+    "Firms with EDGAR ESG in At Least One Year",
+    "Firms Missing date_added",
+    "Firms Missing CIK"
+  ),
+  numerator = c(
+    dplyr::n_distinct(panel_for_usability$symbol),
+    dplyr::n_distinct(panel_for_usability$year),
+    nrow(panel_for_usability),
+    dplyr::n_distinct(panel_for_usability$symbol[panel_for_usability$price_available]),
+    dplyr::n_distinct(panel_for_usability$symbol[panel_for_usability$snapshot_available]),
+    dplyr::n_distinct(panel_for_usability$symbol[panel_for_usability$edgar_available]),
+    dplyr::n_distinct(panel_for_usability$symbol[!panel_for_usability$has_date_added]),
+    dplyr::n_distinct(panel_for_usability$symbol[!panel_for_usability$has_cik])
+  ),
+  denominator = NA_real_,
+  coverage_rate = NA_real_
+)
+
+overview_dual_denominator <- bind_rows(
+  overview_base,
+  overall_coverage_dual
+) %>%
+  arrange(summary_group, denominator_type, metric)
+
+coverage_by_sector_dual <- bind_rows(
+  firm_year_metric_long %>%
+    group_by(sector_standardized, metric, metric_label) %>%
+    summarise(
+      firms_in_sector = dplyr::n_distinct(symbol),
+      numerator = sum(available, na.rm = TRUE),
+      denominator = n(),
+      coverage_rate = if_else(denominator > 0, numerator / denominator, NA_real_),
+      denominator_type = "full_sample",
+      coverage_period = "all_years_avg",
+      .groups = "drop"
+    ),
+  firm_year_metric_long %>%
+    filter(eligible_by_year) %>%
+    group_by(sector_standardized, metric, metric_label) %>%
+    summarise(
+      firms_in_sector = dplyr::n_distinct(symbol),
+      numerator = sum(available, na.rm = TRUE),
+      denominator = n(),
+      coverage_rate = if_else(denominator > 0, numerator / denominator, NA_real_),
+      denominator_type = "effective_sample",
+      coverage_period = "all_years_avg",
+      .groups = "drop"
+    ),
+  firm_year_metric_long %>%
+    filter(year == END_YEAR) %>%
+    group_by(sector_standardized, metric, metric_label) %>%
+    summarise(
+      firms_in_sector = dplyr::n_distinct(symbol),
+      numerator = sum(available, na.rm = TRUE),
+      denominator = n(),
+      coverage_rate = if_else(denominator > 0, numerator / denominator, NA_real_),
+      denominator_type = "full_sample",
+      coverage_period = sprintf("year_%s", END_YEAR),
+      .groups = "drop"
+    ),
+  firm_year_metric_long %>%
+    filter(year == END_YEAR, eligible_by_year) %>%
+    group_by(sector_standardized, metric, metric_label) %>%
+    summarise(
+      firms_in_sector = dplyr::n_distinct(symbol),
+      numerator = sum(available, na.rm = TRUE),
+      denominator = n(),
+      coverage_rate = if_else(denominator > 0, numerator / denominator, NA_real_),
+      denominator_type = "effective_sample",
+      coverage_period = sprintf("year_%s", END_YEAR),
+      .groups = "drop"
+    )
+) %>%
+  mutate(
+    denominator_label = unname(denominator_labels[denominator_type])
+  ) %>%
+  arrange(coverage_period, denominator_type, sector_standardized, metric)
+
+# ---- Field-level missingness: how many NAs per column? ----
+field_missingness <- tibble(
+  field = names(panel_for_usability),
+  missing_count = purrr::map_int(names(panel_for_usability), ~ sum(is.na(panel_for_usability[[.x]]))),
+  missing_rate = purrr::map_dbl(names(panel_for_usability), ~ mean(is.na(panel_for_usability[[.x]])))
+) %>%
+  mutate(
+    non_missing_rate = 1 - missing_rate,
+    field_group = purrr::map_chr(field, classify_panel_field_group)
+  ) %>%
+  arrange(desc(missing_rate), field)
+
+# ---- Classify each company into one of six fixed coverage buckets ----
+company_coverage_buckets <- company_flags_for_usability %>%
+  mutate(
+    company_bucket = case_when(
+      any_price & snapshot_available & any_edgar ~ "price+snapshot+edgar",
+      any_price & snapshot_available & !any_edgar ~ "price+snapshot",
+      any_price & !snapshot_available & any_edgar ~ "price+edgar",
+      any_price & !snapshot_available & !any_edgar ~ "price_only",
+      !any_price & snapshot_available & !any_edgar ~ "snapshot_only",
+      TRUE ~ "none"
+    ),
+    company_bucket = factor(company_bucket, levels = bucket_levels, ordered = TRUE)
+  ) %>%
+  count(company_bucket, name = "company_count", .drop = FALSE) %>%
+  mutate(
+    share = company_count / sum(company_count),
+    company_bucket = as.character(company_bucket)
+  )
+
+# ---- Document boundary cases: missing identifiers, edge firms, ineligible rows ----
+special_cases_summary <- tibble(
+  scope = c(
+    "company",
+    "company",
+    "company",
+    "company",
+    "company",
+    "company",
+    "company",
+    "firm_year"
+  ),
+  metric = c(
+    "companies_missing_date_added",
+    "companies_missing_cik",
+    "companies_without_any_price",
+    "companies_without_any_snapshot",
+    "companies_without_any_edgar",
+    "companies_with_edgar_but_no_price",
+    "companies_bucketed_as_none",
+    "firm_years_not_eligible_by_year"
+  ),
+  value = c(
+    dplyr::n_distinct(panel_for_usability$symbol[!panel_for_usability$has_date_added]),
+    dplyr::n_distinct(panel_for_usability$symbol[!panel_for_usability$has_cik]),
+    sum(!company_flags_for_usability$any_price, na.rm = TRUE),
+    sum(!company_flags_for_usability$snapshot_available, na.rm = TRUE),
+    sum(!company_flags_for_usability$any_edgar, na.rm = TRUE),
+    sum(company_flags_for_usability$any_edgar & !company_flags_for_usability$any_price, na.rm = TRUE),
+    company_coverage_buckets$company_count[company_coverage_buckets$company_bucket == "none"],
+    sum(!panel_for_usability$eligible_by_year, na.rm = TRUE)
+  ),
+  note = c(
+    "Firms missing date_added are retained in the effective-sample denominator by default",
+    "Missing CIK affects the interpretation of downstream EDGAR matching",
+    "No company-level observation ever has price_available = TRUE",
+    "No company-level observation ever has snapshot_available = TRUE",
+    "No company-level observation ever has edgar_available = TRUE",
+    "These firms are folded into the none bucket",
+    "Fallback category within the fixed six coverage buckets",
+    "These observations enter the denominator only under the full_sample definition"
+  )
+)
+
+data.table::fwrite(overview_dual_denominator, OUTPUT_USABILITY_FILES$overview)
+data.table::fwrite(coverage_by_year_dual, OUTPUT_USABILITY_FILES$coverage_year)
+data.table::fwrite(coverage_by_sector_dual, OUTPUT_USABILITY_FILES$coverage_sector)
+data.table::fwrite(field_missingness, OUTPUT_USABILITY_FILES$field_missingness)
+data.table::fwrite(company_coverage_buckets, OUTPUT_USABILITY_FILES$company_buckets)
+data.table::fwrite(special_cases_summary, OUTPUT_USABILITY_FILES$special_cases)
+
+overview_dual_denominator %>%
+  filter(summary_group == "base") %>%
+  select(metric_label, numerator) %>%
+  knitr::kable()
+
+coverage_by_year_dual %>%
+  filter(metric %in% c("price_available", "snapshot_available", "edgar_available")) %>%
+  select(year, denominator_label, metric_label, numerator, denominator, coverage_rate) %>%
+  head(12) %>%
+  knitr::kable()
+```
