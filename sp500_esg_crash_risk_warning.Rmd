@@ -1997,3 +1997,169 @@ calc_pr_auc <- function(truth, probability) {
 
   order_index <- order(probability, decreasing = TRUE)
   sorted_truth <- truth[order_index]
+   true_positive <- cumsum(sorted_truth == 1)
+  false_positive <- cumsum(sorted_truth == 0)
+  precision <- true_positive / (true_positive + false_positive)
+  recall <- true_positive / positive_total
+  precision <- c(1, precision)
+  recall <- c(0, recall)
+
+  sum((recall[-1] - recall[-length(recall)]) * precision[-1], na.rm = TRUE)
+}
+
+# F-beta score with beta = 0.5 (weights precision 2× more than recall).
+# We prioritize precision because flagging too many non-crash firms as "high risk"
+# erodes the credibility of the warning system more than missing a few crashes.
+calc_fbeta <- function(precision, recall, beta_weight = 0.5) {
+  if (is.na(precision) || is.na(recall) || (precision + recall) == 0) {
+    return(NA_real_)
+  }
+
+  beta_square <- beta_weight ^ 2
+  (1 + beta_square) * precision * recall / (beta_square * precision + recall)
+}
+
+calc_precision_at_top_share <- function(truth, probability, share = 0.10) {
+  truth <- as.integer(truth)
+  valid_index <- !is.na(truth) & !is.na(probability)
+  truth <- truth[valid_index]
+  probability <- probability[valid_index]
+
+  if (length(truth) == 0) {
+    return(NA_real_)
+  }
+
+  k <- max(1, ceiling(length(truth) * share))
+  order_index <- order(probability, decreasing = TRUE)
+  mean(truth[order_index[seq_len(k)]] == 1)
+}
+
+calc_top_n_hit_summary <- function(truth, probability, top_n = 20) {
+  truth <- as.integer(truth)
+  valid_index <- !is.na(truth) & !is.na(probability)
+  truth <- truth[valid_index]
+  probability <- probability[valid_index]
+
+  if (length(truth) == 0) {
+    return(list(rate = NA_real_, hits = NA_integer_, k = 0L))
+  }
+
+  k <- min(top_n, length(truth))
+  order_index <- order(probability, decreasing = TRUE)
+  hits <- sum(truth[order_index[seq_len(k)]] == 1)
+
+  list(
+    rate = hits / k,
+    hits = hits,
+    k = k
+  )
+}
+
+build_pr_curve_data <- function(actual, probability, model_label) {
+  valid_index <- !is.na(actual) & !is.na(probability)
+  actual <- as.integer(actual[valid_index])
+  probability <- as.numeric(probability[valid_index])
+
+  if (length(actual) == 0 || sum(actual == 1) == 0) {
+    return(tibble())
+  }
+
+  order_index <- order(probability, decreasing = TRUE)
+  sorted_truth <- actual[order_index]
+  sorted_probability <- probability[order_index]
+  true_positive <- cumsum(sorted_truth == 1)
+  false_positive <- cumsum(sorted_truth == 0)
+  positive_total <- sum(sorted_truth == 1)
+
+  tibble(
+    model_label = model_label,
+    step = seq_along(sorted_probability),
+    threshold = sorted_probability,
+    precision = true_positive / (true_positive + false_positive),
+    recall = true_positive / positive_total
+  )
+}
+
+choose_threshold_from_validation <- function(threshold_table) {
+  threshold_table %>%
+    mutate(
+      rank_f0_5 = dplyr::dense_rank(desc(mean_f0_5)),
+      rank_precision = dplyr::dense_rank(desc(mean_precision))
+    ) %>%
+    arrange(rank_f0_5, rank_precision, desc(mean_pr_auc_proxy), threshold) %>%
+    slice(1) %>%
+    select(-rank_f0_5, -rank_precision)
+}
+
+# ---- Feature preprocessing ----
+# Prepares feature matrices for model fitting:
+#   - Continuous features: median-impute NAs, optionally standardize (z-score)
+#   - Binary features (missingness flags, availability dummies): impute NAs to 0
+# Median imputation is used (rather than mean) because it's robust to outliers in
+# financial variables like volume and drawdown.
+
+build_model_frame <- function(train_data, apply_data, feature_cols, binary_features = character(), standardize = FALSE) {
+  train_frame <- train_data %>%
+    select(all_of(feature_cols)) %>%
+    mutate(across(everything(), as.numeric))
+
+  apply_frame <- apply_data %>%
+    select(all_of(feature_cols)) %>%
+    mutate(across(everything(), as.numeric))
+
+  binary_features <- intersect(binary_features, feature_cols)
+  continuous_features <- setdiff(feature_cols, binary_features)
+
+  if (length(binary_features) > 0) {
+    for (feature_name in binary_features) {
+      train_frame[[feature_name]][is.na(train_frame[[feature_name]])] <- 0
+      apply_frame[[feature_name]][is.na(apply_frame[[feature_name]])] <- 0
+    }
+  }
+
+  if (length(continuous_features) > 0) {
+    for (feature_name in continuous_features) {
+      median_value <- median(train_frame[[feature_name]], na.rm = TRUE)
+      if (!is.finite(median_value)) {
+        median_value <- 0
+      }
+
+      train_frame[[feature_name]][is.na(train_frame[[feature_name]])] <- median_value
+      apply_frame[[feature_name]][is.na(apply_frame[[feature_name]])] <- median_value
+
+      if (standardize) {
+        mean_value <- mean(train_frame[[feature_name]], na.rm = TRUE)
+        sd_value <- sd(train_frame[[feature_name]], na.rm = TRUE)
+        if (!is.finite(sd_value) || sd_value == 0) {
+          sd_value <- 1
+        }
+
+        train_frame[[feature_name]] <- (train_frame[[feature_name]] - mean_value) / sd_value
+        apply_frame[[feature_name]] <- (apply_frame[[feature_name]] - mean_value) / sd_value
+      }
+    }
+  }
+
+  list(
+    train = train_frame,
+    apply = apply_frame
+  )
+}
+
+
+```
+
+## Machine Learning Risk Warning — Two-Year External Validation
+
+The two-year warning extends the one-year setup with a longer forecast window:
+a firm is flagged if it crashes in **either** of the next two years. This
+reduces false negatives at the cost of more false positives, which may be
+acceptable for screening systems that prioritize recall over precision.
+
+The pipeline mirrors the one-year structure but with:
+- Two-year labels: `future_2y_crash_dummy = crash_t1 | crash_t2`
+- Two-year price extensions (2024 + 2025 fetched)
+- Feature-year CV instead of target-year CV
+- Confusion matrix outputs for all models
+
+### Two-Year Machine Learning Helper Functions
