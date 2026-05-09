@@ -2489,3 +2489,146 @@ two_year_label_summary <- crash_metrics_extended %>%
 
 two_year_label_summary %>% knitr::kable(digits = 4)
 ```
+
+### Build the Two-Year Supervised Learning Sample
+
+The two-year sample pairs feature year (t) with a two-year-ahead window
+[t+1, t+2]. A firm is labeled positive if it experiences a crash in either year.
+The label construction:
+  - `crash_t1`: crash event in t+1
+  - `crash_t2`: crash event in t+2
+  - `future_2y_crash_dummy`: crash_t1 | crash_t2 (only when both years are observed)
+
+```{r ml-warning-2y-sample}
+# ---- Reuse the same feature column groups from the one-year setup ----
+price_feature_cols <- c(
+  "annual_return",
+  "annual_log_return",
+  "annual_volatility",
+  "max_drawdown",
+  "avg_volume",
+  "median_volume",
+  "n_trading_days"
+)
+
+snapshot_numeric_cols <- c(
+  "snapshot_total_esg_risk",
+  "snapshot_environment_risk",
+  "snapshot_social_risk",
+  "snapshot_governance_risk",
+  "snapshot_controversy_score",
+  "snapshot_esg_percentile"
+)
+
+edgar_numeric_cols <- c(
+  "edgar_e_score",
+  "edgar_s_score",
+  "edgar_g_score",
+  "edgar_esg_total",
+  "edgar_word_count"
+)
+
+warning_feature_panel_2y <- panel_for_usability %>%
+  transmute(
+    symbol,
+    company_name,
+    sector_standardized,
+    feature_year = year,
+    window_start_year = year + 1L,
+    window_end_year = year + 2L,
+    eligible_by_year,
+    across(all_of(price_feature_cols)),
+    snapshot_available = as.integer(snapshot_available),
+    edgar_available = as.integer(edgar_available),
+    across(all_of(snapshot_numeric_cols)),
+    across(all_of(edgar_numeric_cols))
+  )
+
+crash_label_t1 <- crash_metrics_extended %>%
+  transmute(
+    symbol,
+    window_start_year = year,
+    crash_t1 = as.integer(CRASH_DUMMY),
+    ncskew_t1 = as.numeric(NCSKEW)
+  )
+
+crash_label_t2 <- crash_metrics_extended %>%
+  transmute(
+    symbol,
+    window_end_year = year,
+    crash_t2 = as.integer(CRASH_DUMMY),
+    ncskew_t2 = as.numeric(NCSKEW)
+  )
+
+# ---- Merge t+1 and t+2 crash labels into a single two-year outcome ----
+ml_warning_panel_2y <- warning_feature_panel_2y %>%
+  left_join(crash_label_t1, by = c("symbol", "window_start_year")) %>%
+  left_join(crash_label_t2, by = c("symbol", "window_end_year")) %>%
+  mutate(
+    across(all_of(snapshot_numeric_cols), ~ suppressWarnings(readr::parse_number(as.character(.x)))),
+    across(all_of(edgar_numeric_cols), ~ suppressWarnings(readr::parse_number(as.character(.x)))),
+    across(all_of(price_feature_cols), ~ suppressWarnings(readr::parse_number(as.character(.x)))),
+    ncskew_t1 = suppressWarnings(readr::parse_number(as.character(ncskew_t1))),
+    ncskew_t2 = suppressWarnings(readr::parse_number(as.character(ncskew_t2))),
+    crash_t1 = as.integer(crash_t1),
+    crash_t2 = as.integer(crash_t2)
+  )
+
+for (feature_name in snapshot_numeric_cols) {
+  ml_warning_panel_2y[[paste0(feature_name, "_is_missing")]] <- as.integer(is.na(ml_warning_panel_2y[[feature_name]]))
+}
+
+for (feature_name in edgar_numeric_cols) {
+  ml_warning_panel_2y[[paste0(feature_name, "_is_missing")]] <- as.integer(is.na(ml_warning_panel_2y[[feature_name]]))
+}
+
+ml_warning_panel_2y <- ml_warning_panel_2y %>%
+  mutate(
+    window_complete = !is.na(crash_t1) & !is.na(crash_t2),
+    future_2y_crash_dummy = if_else(
+      window_complete,
+      as.integer(crash_t1 == 1L | crash_t2 == 1L),
+      NA_integer_
+    ),
+    data_split = case_when(
+      feature_year >= START_YEAR & feature_year <= (END_YEAR - 1L) ~ "pre_external_training_pool",
+      feature_year == END_YEAR ~ "external_2024_2025_test",
+      TRUE ~ "unused"
+    )
+  ) %>%
+  filter(feature_year >= START_YEAR, window_end_year <= WARNING_EXTERNAL_END_YEAR)
+
+training_pool <- ml_warning_panel_2y %>%
+  filter(
+    eligible_by_year,
+    window_complete,
+    data_split == "pre_external_training_pool"
+  )
+
+external_test_pool <- ml_warning_panel_2y %>%
+  filter(
+    eligible_by_year,
+    window_complete,
+    feature_year == END_YEAR,
+    data_split == "external_2024_2025_test"
+  )
+
+data.table::fwrite(ml_warning_panel_2y, DERIVED_ML_FILES$ml_panel)
+data.table::fwrite(training_pool, OUTPUT_ML_FILES$training_panel)
+
+tibble(
+  sample_name = c("training_pool_2y", "external_test_pool_2y"),
+  rows = c(nrow(training_pool), nrow(external_test_pool)),
+  companies = c(dplyr::n_distinct(training_pool$symbol), dplyr::n_distinct(external_test_pool$symbol)),
+  positive_rate = c(mean(training_pool$future_2y_crash_dummy, na.rm = TRUE), mean(external_test_pool$future_2y_crash_dummy, na.rm = TRUE)),
+  feature_year_span = c(
+    paste(range(training_pool$feature_year, na.rm = TRUE), collapse = "-"),
+    paste(range(external_test_pool$feature_year, na.rm = TRUE), collapse = "-")
+  ),
+  window_span = c(
+    paste0(min(training_pool$window_start_year, na.rm = TRUE), "-", max(training_pool$window_end_year, na.rm = TRUE)),
+    paste0(min(external_test_pool$window_start_year, na.rm = TRUE), "-", max(external_test_pool$window_end_year, na.rm = TRUE))
+  )
+) %>%
+  knitr::kable(digits = 4)
+```
