@@ -3290,6 +3290,6 @@ ml_output_table_2y <- tibble(
   )
 )
 
-knit::kable(ml_output_table_2y)
+knitr::kable(ml_output_table_2y)
 ```
 
