@@ -2632,3 +2632,149 @@ tibble(
 ) %>%
   knitr::kable(digits = 4)
 ```
+
+### Two-Year Model Training and Threshold Selection
+
+Training uses **feature-year CV** (2018-2022): models train on earlier feature years
+and validate on each holdout feature year. This differs from the one-year setup
+(target-year CV) because each feature year's validation window spans two future years,
+making target-year splits less clean.
+
+The same 6 model specifications (3 feature sets × 2 algorithms) are reused so
+one-year and two-year results are directly comparable.
+
+```{r ml-warning-2y-training}
+snapshot_missing_flags <- paste0(snapshot_numeric_cols, "_is_missing")
+edgar_missing_flags <- paste0(edgar_numeric_cols, "_is_missing")
+
+# ---- Mirror the one-year specifications (same feature sets, same algorithms) ----
+model_specifications <- tibble(
+  feature_set_id = c("price_baseline", "price_plus_snapshot_esg", "price_plus_full_esg"),
+  feature_set_label = c("Price Baseline", "Price + Snapshot ESG", "Price + Full ESG"),
+  feature_columns = list(
+    price_feature_cols,
+    c(price_feature_cols, "snapshot_available", snapshot_numeric_cols, snapshot_missing_flags),
+    c(price_feature_cols, "snapshot_available", snapshot_numeric_cols, snapshot_missing_flags, "edgar_available", edgar_numeric_cols, edgar_missing_flags)
+  ),
+  binary_columns = list(
+    character(),
+    c("snapshot_available", snapshot_missing_flags),
+    c("snapshot_available", snapshot_missing_flags, "edgar_available", edgar_missing_flags)
+  )
+) %>%
+  tidyr::crossing(
+    tibble(
+      model_type = c("weighted_logistic", "ranger_probability_forest"),
+      model_label = c("Weighted Logistic", "Probability Random Forest")
+    )
+  ) %>%
+  mutate(
+    model_key = paste(feature_set_id, model_type, sep = "__"),
+    model_display = paste(feature_set_label, model_label, sep = " | ")
+  )
+
+# ---- Feature-year CV: validate on 2018-2022 features, reserve 2023 for external test ----
+validation_feature_years <- 2018:2022
+threshold_grid <- seq(0.05, 0.95, by = 0.01)
+
+validation_fold_results <- list()
+validation_threshold_results <- list()
+
+for (spec_index in seq_len(nrow(model_specifications))) {
+  one_spec <- model_specifications[spec_index, ]
+  feature_columns <- one_spec$feature_columns[[1]]
+  binary_columns <- one_spec$binary_columns[[1]]
+
+  for (one_validation_feature_year in validation_feature_years) {
+    train_fold <- training_pool %>%
+      filter(feature_year < one_validation_feature_year)
+
+    valid_fold <- training_pool %>%
+      filter(feature_year == one_validation_feature_year)
+
+    if (nrow(train_fold) == 0 || nrow(valid_fold) == 0) {
+      next
+    }
+
+    fitted_output <- if (one_spec$model_type[[1]] == "weighted_logistic") {
+      fit_weighted_logistic_model_target(
+        train_data = train_fold,
+        apply_data = valid_fold,
+        feature_cols = feature_columns,
+        target_col = "future_2y_crash_dummy",
+        binary_features = binary_columns
+      )
+    } else {
+      fit_ranger_probability_model_target(
+        train_data = train_fold,
+        apply_data = valid_fold,
+        feature_cols = feature_columns,
+        target_col = "future_2y_crash_dummy",
+        binary_features = binary_columns
+      )
+    }
+
+    if (is.null(fitted_output)) {
+      next
+    }
+
+    fold_prediction <- valid_fold %>%
+      transmute(
+        model_key = one_spec$model_key[[1]],
+        model_display = one_spec$model_display[[1]],
+        feature_set_id = one_spec$feature_set_id[[1]],
+        feature_set_label = one_spec$feature_set_label[[1]],
+        model_type = one_spec$model_type[[1]],
+        model_label = one_spec$model_label[[1]],
+        validation_feature_year = one_validation_feature_year,
+        validation_window = paste0(window_start_year, "-", window_end_year),
+        symbol,
+        company_name,
+        actual_label = future_2y_crash_dummy,
+        crash_t1,
+        crash_t2,
+        risk_probability = fitted_output$probability
+      ) %>%
+      mutate(
+        risk_rank = min_rank(desc(risk_probability))
+      )
+
+    fold_metrics <- calc_classification_metrics(
+      actual = fold_prediction$actual_label,
+      probability = fold_prediction$risk_probability,
+      threshold = 0.50
+    ) %>%
+      mutate(
+        model_key = one_spec$model_key[[1]],
+        model_display = one_spec$model_display[[1]],
+        feature_set_id = one_spec$feature_set_id[[1]],
+        feature_set_label = one_spec$feature_set_label[[1]],
+        model_type = one_spec$model_type[[1]],
+        model_label = one_spec$model_label[[1]],
+        validation_feature_year = one_validation_feature_year,
+        validation_window = paste0(min(valid_fold$window_start_year), "-", max(valid_fold$window_end_year)),
+        train_rows = nrow(train_fold),
+        validation_rows = nrow(valid_fold),
+        train_positive_rate = mean(train_fold$future_2y_crash_dummy, na.rm = TRUE),
+        validation_positive_rate = mean(valid_fold$future_2y_crash_dummy, na.rm = TRUE)
+      )
+
+    threshold_metrics <- build_threshold_metrics(
+      actual = fold_prediction$actual_label,
+      probability = fold_prediction$risk_probability,
+      thresholds = threshold_grid
+    ) %>%
+      mutate(
+        model_key = one_spec$model_key[[1]],
+        model_display = one_spec$model_display[[1]],
+        feature_set_id = one_spec$feature_set_id[[1]],
+        feature_set_label = one_spec$feature_set_label[[1]],
+        model_type = one_spec$model_type[[1]],
+        model_label = one_spec$model_label[[1]],
+        validation_feature_year = one_validation_feature_year
+      )
+
+    validation_fold_results[[length(validation_fold_results) + 1]] <- fold_metrics
+    validation_threshold_results[[length(validation_threshold_results) + 1]] <- threshold_metrics
+  }
+}
