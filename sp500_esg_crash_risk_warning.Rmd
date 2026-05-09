@@ -1079,3 +1079,110 @@ The usability audit measures how complete the panel is under two denominator def
 This dual view matters because a firm that joined the S&P 500 in 2020 cannot
 reasonably be expected to have historical data in 2012.
 
+### Prepare Usability Audit Data
+
+```{r usability-setup}
+# ---- Reload the merged panel with strict type coercion ----
+panel_for_usability <- readr::read_csv(
+  OUTPUT_FILES$panel,
+  show_col_types = FALSE
+) %>%
+  mutate(
+    year = as.integer(year),
+    date_added = suppressWarnings(as.Date(date_added)),
+    price_available = coalesce(as.logical(price_available), FALSE),
+    snapshot_available = coalesce(as.logical(snapshot_available), FALSE),
+    edgar_available = coalesce(as.logical(edgar_available), FALSE),
+    eligible_by_year = coalesce(as.logical(is_post_index_addition), TRUE),
+    price_and_snapshot = price_available & snapshot_available,
+    price_and_edgar = price_available & edgar_available,
+    has_cik = !is.na(cik) & stringr::str_trim(as.character(cik)) != "",
+    has_date_added = !is.na(date_added),
+    sector_standardized = dplyr::case_when(
+      gics_sector == "Technology" ~ "Information Technology",
+      gics_sector == "Healthcare" ~ "Health Care",
+      gics_sector == "Financial Services" ~ "Financials",
+      TRUE ~ gics_sector
+    )
+  )
+
+legacy_coverage_by_year <- readr::read_csv(
+  OUTPUT_FILES$coverage_year,
+  show_col_types = FALSE
+)
+
+company_flags_for_usability <- readr::read_csv(
+  OUTPUT_FILES$coverage_company,
+  show_col_types = FALSE
+) %>%
+  mutate(
+    any_price = coalesce(as.logical(any_price), FALSE),
+    any_edgar = coalesce(as.logical(any_edgar), FALSE),
+    snapshot_available = coalesce(as.logical(snapshot_available), FALSE),
+    has_cik = !is.na(cik) & stringr::str_trim(as.character(cik)) != ""
+  )
+
+# ---- Define the five coverage metrics tracked throughout the audit ----
+# "available" = the data source exists for that firm-year row
+# Joint metrics (price_and_snapshot, price_and_edgar) measure co-occurrence
+metric_levels <- c(
+  "price_available",
+  "snapshot_available",
+  "edgar_available",
+  "price_and_snapshot",
+  "price_and_edgar"
+)
+
+metric_labels <- c(
+  price_available = "Price Data",
+  snapshot_available = "Snapshot ESG",
+  edgar_available = "EDGAR ESG",
+  price_and_snapshot = "Price + Snapshot ESG",
+  price_and_edgar = "Price + EDGAR ESG"
+)
+
+denominator_labels <- c(
+  full_sample = "Full Sample (503 Firms)",
+  effective_sample = "Effective Post-Entry Sample"
+)
+
+metric_colors <- c(
+  "Price Data" = "#2F6DB3",
+  "Snapshot ESG" = "#2A9D55",
+  "EDGAR ESG" = "#E68613",
+  "Price + Snapshot ESG" = "#1F8A8A",
+  "Price + EDGAR ESG" = "#4D4D4D"
+)
+
+bucket_levels <- c(
+  "price+snapshot+edgar",
+  "price+snapshot",
+  "price+edgar",
+  "price_only",
+  "snapshot_only",
+  "none"
+)
+
+# ---- Classify each panel column into a logical field group for the missingness audit ----
+classify_panel_field_group <- function(field_name) {
+  dplyr::case_when(
+    field_name %in% c("symbol", "symbol_raw", "company_name", "cik", "gics_sector",
+                      "gics_sub_industry", "headquarters_location", "date_added",
+                      "founded", "year") ~ "company_static",
+    stringr::str_starts(field_name, "snapshot_") ~ "snapshot_esg",
+    field_name %in% c("n_trading_days", "first_trade", "last_trade", "start_price",
+                      "end_price", "annual_return", "annual_log_return",
+                      "annual_volatility", "avg_volume", "median_volume",
+                      "max_drawdown") ~ "price_features",
+    stringr::str_starts(field_name, "edgar_") ~ "edgar_esg",
+    field_name %in% c("price_available", "eligible_by_year", "price_and_snapshot",
+                      "price_and_edgar", "has_cik", "has_date_added",
+                      "is_post_index_addition", "panel_row_status",
+                      "sector_standardized") ~ "flags",
+    TRUE ~ "other"
+  )
+}
+
+# The full-sample denominator is always 503 (or the total distinct symbols in the panel)
+full_sample_denominator <- dplyr::n_distinct(panel_for_usability$symbol)
+```
