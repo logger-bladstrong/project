@@ -2163,3 +2163,74 @@ The pipeline mirrors the one-year structure but with:
 - Confusion matrix outputs for all models
 
 ### Two-Year Machine Learning Helper Functions
+```{r ml-warning-2y-helpers}
+# ---- Standardize raw Yahoo Finance CSV into the canonical price format ----
+standardize_warning_price_frame <- function(price_raw, price_map) {
+  price_raw <- price_raw %>%
+    mutate(
+      price_symbol = as.character(price_symbol),
+      date = as.Date(date),
+      adj_close = as.numeric(adj_close),
+      volume = as.numeric(volume)
+    ) %>%
+    filter(!is.na(adj_close))
+
+  price_has_metadata <- all(
+    c("symbol", "company_name", "cik", "gics_sector", "gics_sub_industry") %in% names(price_raw)
+  )
+
+  if (price_has_metadata) {
+    price_raw %>%
+      transmute(
+        price_symbol = price_symbol,
+        date = date,
+        adj_close = adj_close,
+        volume = volume,
+        symbol = as.character(symbol),
+        company_name = as.character(company_name),
+        cik = cik,
+        gics_sector = as.character(gics_sector),
+        gics_sub_industry = as.character(gics_sub_industry)
+      ) %>%
+      arrange(symbol, date)
+  } else {
+    price_raw %>%
+      select(price_symbol, date, adj_close, volume) %>%
+      inner_join(price_map, by = c("price_symbol" = "symbol")) %>%
+      transmute(
+        price_symbol = price_symbol,
+        date = date,
+        adj_close = adj_close,
+        volume = volume,
+        symbol = price_symbol,
+        company_name = as.character(company_name),
+        cik = cik,
+        gics_sector = as.character(gics_sector),
+        gics_sub_industry = as.character(gics_sub_industry)
+      ) %>%
+      arrange(symbol, date)
+  }
+}
+
+# ---- Fetch or load a single year of daily prices, caching to CSV ----
+ensure_warning_price_year <- function(year_value, output_file, price_map, force_refresh = FALSE) {
+  start_date <- sprintf("%d-01-01", year_value)
+  end_date_exclusive <- sprintf("%d-01-01", year_value + 1L)
+
+  if (!file.exists(output_file) || force_refresh) {
+    message(sprintf(">>> Fetching %d daily prices through the Python Yahoo Finance fallback", year_value))
+    fetch_log <- fetch_yahoo_prices_python(
+      tickers = price_map$symbol,
+      start_date = start_date,
+      end_date_exclusive = end_date_exclusive,
+      output_file = output_file
+    )
+    message(paste(fetch_log, collapse = "\n"))
+  }
+
+  standardized_prices <- readr::read_csv(output_file, show_col_types = FALSE) %>%
+    standardize_warning_price_frame(price_map = price_map)
+
+  data.table::fwrite(standardized_prices, output_file)
+  standardized_prices
+}
