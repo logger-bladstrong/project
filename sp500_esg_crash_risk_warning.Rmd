@@ -1667,3 +1667,133 @@ usability_output_table <- tibble(
 
 knitr::kable(usability_output_table)
 ```
+
+## Machine Learning Helper Functions
+
+Shared functions for crash-label construction, classification metrics, feature
+preprocessing, and model fitting. Used by the two-year crash-risk warning pipeline
+in the next section.
+
+```{r ml-warning-helpers}
+# ---------------------------------------------------------------------------
+# Python fallback for Yahoo Finance price downloads
+# ---------------------------------------------------------------------------
+# When cached price files are missing, we call a Python script that uses
+# Yahoo Finance's chart API. R's quantmod/tidyquant can be unreliable for
+# bulk downloads, hence the Python fallback.
+
+detect_workspace_python <- function() {
+  candidates <- c(
+    file.path(Sys.getenv("USERPROFILE"), ".cache", "codex-runtimes", "codex-primary-runtime", "dependencies", "python", "python.exe"),
+    Sys.which("python")
+  )
+
+  valid_candidates <- candidates[nzchar(candidates) & file.exists(candidates)]
+  if (length(valid_candidates) == 0) {
+    return(NA_character_)
+  }
+
+  valid_candidates[[1]]
+}
+
+fetch_yahoo_prices_python <- function(tickers, start_date, end_date_exclusive, output_file) {
+  python_path <- detect_workspace_python()
+
+  if (is.na(python_path) || !file.exists(python_path)) {
+    stop("No accessible Python runtime was found for the Yahoo Finance fallback.")
+  }
+
+  tickers <- unique(tickers[!is.na(tickers) & nzchar(tickers)])
+  tickers_file <- tempfile(fileext = ".txt")
+  script_file <- tempfile(fileext = ".py")
+  writeLines(tickers, tickers_file, useBytes = TRUE)
+
+  script_lines <- c(
+    "import csv",
+    "import json",
+    "import sys",
+    "import time",
+    "import urllib.parse",
+    "import urllib.request",
+    "from concurrent.futures import ThreadPoolExecutor, as_completed",
+    "from datetime import datetime, timezone",
+    "",
+    "tickers_file, output_file, start_date, end_date = sys.argv[1:5]",
+    "with open(tickers_file, 'r', encoding='utf-8') as handle:",
+    "    tickers = [line.strip() for line in handle if line.strip()]",
+    "",
+    "period1 = int(datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc).timestamp())",
+    "period2 = int(datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc).timestamp())",
+    "headers = {'User-Agent': 'Mozilla/5.0'}",
+    "",
+    "def fetch_one(ticker):",
+    "    encoded_ticker = urllib.parse.quote(ticker)",
+    "    url = f'https://query2.finance.yahoo.com/v8/finance/chart/{encoded_ticker}?period1={period1}&period2={period2}&interval=1d&events=div%2Csplits&includeAdjustedClose=true'",
+    "    last_error = None",
+    "    for attempt in range(3):",
+    "        try:",
+    "            request = urllib.request.Request(url, headers=headers)",
+    "            with urllib.request.urlopen(request, timeout=30) as response:",
+    "                payload = json.loads(response.read().decode('utf-8'))",
+    "            result = (payload.get('chart', {}) or {}).get('result')",
+    "            if not result:",
+    "                return ticker, [], str((payload.get('chart', {}) or {}).get('error'))",
+    "            result = result[0]",
+    "            timestamps = result.get('timestamp') or []",
+    "            indicators = result.get('indicators') or {}",
+    "            quote = (indicators.get('quote') or [{}])[0]",
+    "            adj_block = (indicators.get('adjclose') or [{}])[0]",
+    "            adj_values = adj_block.get('adjclose')",
+    "            if adj_values is None:",
+    "                adj_values = quote.get('close') or []",
+    "            volume_values = quote.get('volume') or []",
+    "            rows = []",
+    "            for idx, one_timestamp in enumerate(timestamps):",
+    "                adj_value = adj_values[idx] if idx < len(adj_values) else None",
+    "                volume_value = volume_values[idx] if idx < len(volume_values) else None",
+    "                if adj_value is None:",
+    "                    continue",
+    "                date_value = datetime.utcfromtimestamp(one_timestamp).strftime('%Y-%m-%d')",
+    "                rows.append([ticker, date_value, adj_value, '' if volume_value is None else volume_value])",
+    "            return ticker, rows, None",
+    "        except Exception as error:",
+    "            last_error = str(error)",
+    "            time.sleep(0.8 * (attempt + 1))",
+    "    return ticker, [], last_error",
+    "",
+    "all_rows = []",
+    "failures = []",
+    "with ThreadPoolExecutor(max_workers=8) as executor:",
+    "    futures = {executor.submit(fetch_one, ticker): ticker for ticker in tickers}",
+    "    for future in as_completed(futures):",
+    "        ticker, rows, error_message = future.result()",
+    "        if rows:",
+    "            all_rows.extend(rows)",
+    "        else:",
+    "            failures.append((ticker, error_message))",
+    "",
+    "with open(output_file, 'w', newline='', encoding='utf-8') as handle:",
+    "    writer = csv.writer(handle)",
+    "    writer.writerow(['price_symbol', 'date', 'adj_close', 'volume'])",
+    "    writer.writerows(all_rows)",
+    "",
+    "if failures:",
+    "    sys.stderr.write('Failed tickers: ' + str(len(failures)) + '\\n')",
+    "    preview = '; '.join([f'{ticker}={message}' for ticker, message in failures[:10]])",
+    "    sys.stderr.write(preview + '\\n')",
+    "",
+    "sys.stdout.write(str(len(all_rows)))"
+  )
+
+  writeLines(script_lines, script_file, useBytes = TRUE)
+
+  command_output <- system2(
+    command = python_path,
+    args = c(script_file, tickers_file, output_file, start_date, end_date_exclusive),
+    stdout = TRUE,
+    stderr = TRUE
+  )
+
+  if (!file.exists(output_file)) {
+    stop("The Python Yahoo download fallback did not create the expected price file.")
+  }
